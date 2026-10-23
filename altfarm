@@ -1,0 +1,1955 @@
+-- Wait for Roblox to finish loading before initializing this script.
+pcall(function()
+    if type(getgenv) == "function" then
+        getgenv().ALTFARM_LOADED = true
+    end
+end)
+
+local COREGUI = game:GetService("CoreGui")
+if not game:IsLoaded() then
+    local notLoaded
+    pcall(function()
+        notLoaded = Instance.new("Message")
+        notLoaded.Text = "AltFarm is waiting for the game to load"
+        notLoaded.Parent = COREGUI
+    end)
+    game.Loaded:Wait()
+    if notLoaded then
+        pcall(function() notLoaded:Destroy() end)
+    end
+end
+
+local Players = game:GetService("Players")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+local Player = Players.LocalPlayer
+local PlayerGui = Player:WaitForChild("PlayerGui")
+
+-- Published host URL is inserted after you provide the raw Pastebin URL.
+local SCRIPT_RAW_URL = "PASTE_RAW_PASTEBIN_URL_HERE"
+local FARM_CONFIG_KEY = "ALT_FARM_CONFIG"
+local KEEP_SCRIPT_FLAG = "ALT_FARM_KEEP_SCRIPT_ENABLED"
+local AUTO_REJOIN_FLAG = "ALT_FARM_AUTO_REJOIN_ENABLED"
+local ACTIVE_SCRIPT_FLAG = "ALT_FARM_ACTIVE_INSTANCE"
+
+-- Read personal configuration supplied by the standalone launcher. This hosted
+-- file deliberately contains no webhook URL or target usernames.
+local ExecutorEnvironment = _G
+pcall(function()
+    if type(getgenv) == "function" then
+        local env = getgenv()
+        if type(env) == "table" then
+            ExecutorEnvironment = env
+        end
+    end
+end)
+
+local InjectedFarmConfig = ExecutorEnvironment[FARM_CONFIG_KEY]
+if type(InjectedFarmConfig) ~= "table" then
+    -- The compact launcher exposes only these two globals before loadstring.
+    -- Accept them as configuration and normalize them for teleport persistence.
+    local globalWebhook = ExecutorEnvironment.WEBHOOK_URL or _G.WEBHOOK_URL
+    local globalTargets = ExecutorEnvironment.TargetNames or _G.TargetNames
+    if type(globalWebhook) == "string" and type(globalTargets) == "table" then
+        InjectedFarmConfig = {
+            WEBHOOK_URL = globalWebhook,
+            TargetNames = globalTargets,
+        }
+        ExecutorEnvironment[FARM_CONFIG_KEY] = InjectedFarmConfig
+    else
+        warn("AltFarm config is missing. Set WEBHOOK_URL and TargetNames in the launcher first.")
+        return
+    end
+end
+
+local WEBHOOK_URL = type(InjectedFarmConfig.WEBHOOK_URL) == "string"
+    and InjectedFarmConfig.WEBHOOK_URL or ""
+local TargetNames = {}
+if type(InjectedFarmConfig.TargetNames) == "table" then
+    for _, targetName in ipairs(InjectedFarmConfig.TargetNames) do
+        if type(targetName) == "string" and targetName ~= "" then
+            table.insert(TargetNames, targetName)
+        end
+    end
+end
+if #TargetNames == 0 then
+    warn("AltFarm config has no TargetNames. Add at least one username in AltFarmLauncher.lua.")
+    return
+end
+
+-- Prevent the launcher and queued teleport bootstrap from starting duplicate copies.
+if ExecutorEnvironment[ACTIVE_SCRIPT_FLAG] == true then
+    warn("AltFarm is already running in this session; duplicate launch skipped.")
+    return
+end
+ExecutorEnvironment[ACTIVE_SCRIPT_FLAG] = true
+
+local WEBHOOK_INTERVAL_SECONDS = 30 * 60
+local Running = true
+local MouseHeld = false
+local HeldKeys = {}
+local TargetTeleporting = false -- Main continuously follows the locked target until it dies; only the next skill attempt can select another.
+local TargetEngaged = false
+local TargetLockedForSkill = nil
+local InVoidPhase = false
+local Mode = "Alt" -- "Main" or "Alt"; Alt is the default
+
+-- Persisted by the launcher and restored by the teleport bootstrap.
+local KeepScriptEnabled = ExecutorEnvironment[KEEP_SCRIPT_FLAG] == true
+local AutoRejoinEnabled = ExecutorEnvironment[AUTO_REJOIN_FLAG] == true
+local AutoRejoinConnections = {}
+local AutoRejoinWatchedTitles = setmetatable({}, { __mode = "k" })
+local AutoRejoinWatchedPromptGuis = setmetatable({}, { __mode = "k" })
+local AutoRejoinMonitorActive = false
+local AutoRejoinInProgress = false
+local AutoRejoinFallbackUsed = false
+local AutoRejoinPrimarySameServer = false
+local AutoRejoinTeleportStarted = false
+local AutoRejoinAttemptGeneration = 0
+local PersistenceTeleportConnection = nil
+
+-- If the editable launcher is executed again during this session, apply its new
+-- settings live without starting a second copy of the main script.
+task.spawn(function()
+    while Running do
+        local candidate = ExecutorEnvironment[FARM_CONFIG_KEY]
+        if type(candidate) == "table" and candidate ~= InjectedFarmConfig then
+            local newNames = {}
+            if type(candidate.TargetNames) == "table" then
+                for _, targetName in ipairs(candidate.TargetNames) do
+                    if type(targetName) == "string" and targetName ~= "" then
+                        table.insert(newNames, targetName)
+                    end
+                end
+            end
+            if type(candidate.WEBHOOK_URL) == "string" and #newNames > 0 then
+                WEBHOOK_URL = candidate.WEBHOOK_URL
+                table.clear(TargetNames)
+                for _, targetName in ipairs(newNames) do
+                    table.insert(TargetNames, targetName)
+                end
+                InjectedFarmConfig = candidate
+                print("AltFarm: applied updated launcher configuration.")
+            else
+                warn("AltFarm ignored an invalid launcher configuration update.")
+            end
+        end
+        task.wait(0.5)
+    end
+end)
+
+-- Best-effort anti-AFK. This may depend on executor support for virtual input.
+local ANTI_AFK_ENABLED = true
+-- Alt-only damage reset. Set the boolean false to disable it, or change
+-- the delay in seconds (0 means reset immediately when damage is detected).
+local ALT_RESET_ON_DAMAGE = true
+local ALT_DAMAGE_RESET_DELAY = 0.7
+-- Alt-only failsafe: reset once after this character life exceeds the limit.
+-- Each CharacterAdded starts a fresh timer; this never runs in Main mode.
+local ALT_ALIVE_FAILSAFE_ENABLED = true
+local ALT_MAX_ALIVE_SECONDS = 15
+local AltAliveFailsafeCharacter = Player.Character
+local AltAliveSince = AltAliveFailsafeCharacter and os.clock() or nil
+local AltAliveResetTriggered = false
+local TARGET_ALIVE_SECONDS = 3.5
+local MAIN_VOID_HEALTH_ZERO_DURATION = 0.01 -- Reapply Health = 0 for this many seconds in Main mode.
+local TARGET_TELEPORT_INTERVAL = 0 -- 0 means continuously re-position on every Heartbeat frame.
+local TARGET_TELEPORT_BLOCK_Y = -500
+local TARGET_TELEPORT_DEEP_VOID_OVERRIDE_Y = -550 -- Below this Y, allow target teleporting again as requested.
+-- Zero means attempt the staging teleport once per Heartbeat frame.
+local STAGING_INTERVAL = 0
+-- STAGE SELECTION: set exactly one option to true and the other to false.
+local USE_SMALL_BASEPLATE_STAGE = false -- Stage 1: (-75, 84, 20352)
+local USE_VOID_STAGE = true             -- Default stage: Void platform center (-200, -300, 10000)
+local SMALL_BASEPLATE_POSITION = Vector3.new(-75, 84, 20352)
+local VOID_STAGE_POSITION = Vector3.new(-200, -300, 10000)
+local VOID_PLATFORM_SIZE = Vector3.new(1000, 5, 1000)
+local VOID_PLATFORM_TRANSPARENCY = 0.5
+local VOID_PLATFORM_NAME = "AutomationVoidStagePlatform"
+-- Randomize the Void-stage position across the FULL width and depth of the platform.
+-- Keep a small edge margin so the character does not spawn half over an edge.
+-- Before selecting a spot, avoid every other living player's character root:
+-- first try positions at least 25 studs away; if crowded, try 45-stud clearance.
+local StagingRandom = Random.new()
+local StagingPositionCharacter = nil
+local CurrentStagingPosition = nil
+-- In Alt mode, stage a character only once per character life. Nearby players
+-- do not cause an already-staged Alt to be moved to a different location.
+local AltStageTeleportedCharacter = nil
+local VOID_STAGE_EDGE_MARGIN = 5
+local VOID_STAGE_MIN_PLAYER_DISTANCE = 25
+local VOID_STAGE_FALLBACK_PLAYER_DISTANCE = 45
+local VOID_STAGE_RANDOM_ATTEMPTS = 80
+local function GetOtherLivingPlayerRoots()
+    local roots = {}
+    for _, otherPlayer in ipairs(Players:GetPlayers()) do
+        if otherPlayer ~= Player then
+            local character = otherPlayer.Character
+            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+            local root = character and character:FindFirstChild("HumanoidRootPart")
+            if humanoid and humanoid.Health > 0 and root and root:IsA("BasePart") then
+                table.insert(roots, root)
+            end
+        end
+    end
+    return roots
+end
+local function GetMinimumPlayerDistance(position, playerRoots)
+    local minimumDistance = math.huge
+    for _, root in ipairs(playerRoots) do
+        if root.Parent then
+            local distance = (root.Position - position).Magnitude
+            if distance < minimumDistance then
+                minimumDistance = distance
+            end
+        end
+    end
+    return minimumDistance
+end
+local function IsSafeVoidPosition(position, playerRoots, minimumDistance)
+    return GetMinimumPlayerDistance(position, playerRoots) >= minimumDistance
+end
+local function MakeRandomVoidPosition()
+    local halfX = math.max(0, VOID_PLATFORM_SIZE.X / 2 - VOID_STAGE_EDGE_MARGIN)
+    local halfZ = math.max(0, VOID_PLATFORM_SIZE.Z / 2 - VOID_STAGE_EDGE_MARGIN)
+    local x = VOID_STAGE_POSITION.X + StagingRandom:NextNumber(-halfX, halfX)
+    local z = VOID_STAGE_POSITION.Z + StagingRandom:NextNumber(-halfZ, halfZ)
+    local y = VOID_STAGE_POSITION.Y + VOID_PLATFORM_SIZE.Y / 2 + 3
+    return Vector3.new(x, y, z)
+end
+local function ChooseSafeVoidPosition()
+    local playerRoots = GetOtherLivingPlayerRoots()
+    local bestPosition = nil
+    local bestDistance = -1
+    -- First pass: rerandomize until the landing point is clear by 25 studs.
+    for _ = 1, VOID_STAGE_RANDOM_ATTEMPTS do
+        local candidate = MakeRandomVoidPosition()
+        local distance = GetMinimumPlayerDistance(candidate, playerRoots)
+        if distance >= VOID_STAGE_MIN_PLAYER_DISTANCE then
+            return candidate
+        end
+        if distance > bestDistance then
+            bestDistance = distance
+            bestPosition = candidate
+        end
+    end
+    -- If the initial random samples were crowded, try for 45-stud clearance.
+    for _ = 1, VOID_STAGE_RANDOM_ATTEMPTS do
+        local candidate = MakeRandomVoidPosition()
+        local distance = GetMinimumPlayerDistance(candidate, playerRoots)
+        if distance >= VOID_STAGE_FALLBACK_PLAYER_DISTANCE then
+            return candidate
+        end
+        if distance > bestDistance then
+            bestDistance = distance
+            bestPosition = candidate
+        end
+    end
+    -- In an unusually crowded server, do not teleport to a point that is still
+    -- within 25 studs of another living player. Return nil and retry next pass.
+    if bestPosition and bestDistance >= VOID_STAGE_MIN_PLAYER_DISTANCE then
+        return bestPosition
+    end
+    return nil
+end
+local function RefreshStagingPositionForCharacter(character)
+    if not character then
+        return nil
+    end
+    StagingPositionCharacter = character
+    if USE_VOID_STAGE then
+        CurrentStagingPosition = ChooseSafeVoidPosition()
+    else
+        CurrentStagingPosition = SMALL_BASEPLATE_POSITION
+    end
+    return CurrentStagingPosition
+end
+local function GetStagingPositionForCharacter(character)
+    if not CurrentStagingPosition or StagingPositionCharacter ~= character then
+        return RefreshStagingPositionForCharacter(character)
+    end
+    return CurrentStagingPosition
+end
+-- Remove the previous Sky-stage platform name if an older script left it behind.
+local legacySkyPlatform = workspace:FindFirstChild("AutomationSkyStagePlatform")
+if legacySkyPlatform then
+    legacySkyPlatform:Destroy()
+end
+if USE_SMALL_BASEPLATE_STAGE == USE_VOID_STAGE then
+    warn("Choose exactly one stage: USE_SMALL_BASEPLATE_STAGE or USE_VOID_STAGE. Defaulting to the small baseplate.")
+    USE_SMALL_BASEPLATE_STAGE = true
+    USE_VOID_STAGE = false
+end
+-- Create/update the Void platform only when Void stage is selected.
+-- This is a client-side part because this code runs in a LocalScript.
+local existingVoidPlatform = workspace:FindFirstChild(VOID_PLATFORM_NAME)
+if USE_VOID_STAGE then
+    if existingVoidPlatform and not existingVoidPlatform:IsA("BasePart") then
+        existingVoidPlatform:Destroy()
+        existingVoidPlatform = nil
+    end
+    local voidPlatform = existingVoidPlatform or Instance.new("Part")
+    voidPlatform.Name = VOID_PLATFORM_NAME
+    voidPlatform.Anchored = true
+    voidPlatform.CanCollide = true
+    voidPlatform.CanTouch = false
+    voidPlatform.Size = VOID_PLATFORM_SIZE
+    voidPlatform.CFrame = CFrame.new(VOID_STAGE_POSITION)
+    voidPlatform.Transparency = VOID_PLATFORM_TRANSPARENCY
+    voidPlatform.Material = Enum.Material.SmoothPlastic
+    voidPlatform.Color = Color3.fromRGB(145, 190, 255)
+    voidPlatform.CastShadow = false
+    voidPlatform.Parent = workspace
+elseif existingVoidPlatform then
+    existingVoidPlatform:Destroy()
+end
+local SpawnTimes = {}
+local AliveSince = {}
+local TrackedTargets = {}
+local Connections = {}
+local StartupTime = os.clock()
+-- Alt-mode forced character spin. Angular speed is in radians per second.
+local ALT_SPIN_RADIANS_PER_SECOND = 2
+local AltSpinAngle = 0
+local AltSpinBindingName = "AutomationAltSpin_" .. tostring(Player.UserId)
+local AltAutoRotateStates = {}
+local AltDamageConnection = nil
+local AltDamageCharacter = nil
+local AltDamageMonitorGeneration = 0
+local AltDamageResetToken = 0
+local AltDamageResetPending = false
+-- Alt-mode animation: keep the track pinned to 11.2 seconds every rendered frame.
+local ALT_ANIMATION_ID = "rbxassetid://71181015443030"
+local ALT_ANIMATION_TIME_POSITION = 11.2
+local AltAnimationTrack = nil
+local AltAnimationObject = nil
+local AltAnimationCharacter = nil
+local AltAnimationLengthWarned = false
+-- Leaderstats and rank-promotion label
+local leaderstats = Player:WaitForChild("leaderstats")
+local TotalKillsStat = leaderstats:WaitForChild("Total Kills")
+local Goal = workspace
+    :WaitForChild("Map")
+    :WaitForChild("Total Kills Leaderboard")
+    :WaitForChild("a")
+    :WaitForChild("SurfaceGui")
+    :WaitForChild("Holder")
+    :WaitForChild("Goal")
+-- Track how long each target character has been alive.
+local function TrackTargetCharacter(targetPlayer, character, isInitialCharacter)
+    if not isInitialCharacter then
+        SpawnTimes[targetPlayer] = os.clock()
+    elseif not SpawnTimes[targetPlayer] then
+        SpawnTimes[targetPlayer] = StartupTime
+    end
+    AliveSince[targetPlayer] = nil
+    TargetEngaged = false
+    task.spawn(function()
+        local humanoid = character:FindFirstChildOfClass("Humanoid")
+            or character:WaitForChild("Humanoid", 10)
+        if not Running or not humanoid or targetPlayer.Character ~= character then
+            return
+        end
+        if humanoid.Health > 0 then
+            AliveSince[targetPlayer] = os.clock()
+        end
+        local healthConnection = humanoid.HealthChanged:Connect(function(health)
+            if targetPlayer.Character ~= character then
+                return
+            end
+            if health > 0 then
+                if not AliveSince[targetPlayer] then
+                    AliveSince[targetPlayer] = os.clock()
+                end
+            else
+                AliveSince[targetPlayer] = nil
+                TargetEngaged = false
+            end
+        end)
+        table.insert(Connections, healthConnection)
+    end)
+end
+local function TrackTarget(targetPlayer)
+    if TrackedTargets[targetPlayer] or not table.find(TargetNames, targetPlayer.Name) then
+        return
+    end
+    TrackedTargets[targetPlayer] = true
+    table.insert(Connections, targetPlayer.CharacterAdded:Connect(function(character)
+        TrackTargetCharacter(targetPlayer, character, false)
+    end))
+    if targetPlayer.Character then
+        TrackTargetCharacter(targetPlayer, targetPlayer.Character, true)
+    end
+end
+for _, targetPlayer in ipairs(Players:GetPlayers()) do
+    TrackTarget(targetPlayer)
+end
+table.insert(Connections, Players.PlayerAdded:Connect(TrackTarget))
+-- GUI
+local Gui = Instance.new("ScreenGui")
+Gui.Name = "AutomationStop"
+Gui.ResetOnSpawn = false
+Gui.DisplayOrder = 9999
+Gui.Parent = PlayerGui
+local StopButton = Instance.new("TextButton")
+StopButton.Name = "Stop"
+StopButton.Size = UDim2.fromOffset(120, 45)
+StopButton.Position = UDim2.fromOffset(25, 120)
+StopButton.BackgroundColor3 = Color3.fromRGB(190, 40, 40)
+StopButton.TextColor3 = Color3.new(1, 1, 1)
+StopButton.Text = "STOP"
+StopButton.TextSize = 20
+StopButton.Font = Enum.Font.GothamBold
+StopButton.Parent = Gui
+local ButtonCorner = Instance.new("UICorner")
+ButtonCorner.CornerRadius = UDim.new(0, 8)
+ButtonCorner.Parent = StopButton
+local function MakeInfoLabel(name, position, size)
+    local label = Instance.new("TextLabel")
+    label.Name = name
+    label.Size = size
+    label.Position = position
+    label.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+    label.BackgroundTransparency = 0.15
+    label.TextColor3 = Color3.new(1, 1, 1)
+    label.TextSize = 16
+    label.Font = Enum.Font.GothamMedium
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.TextYAlignment = Enum.TextYAlignment.Center
+    label.TextTruncate = Enum.TextTruncate.AtEnd
+    label.Text = "Loading..."
+    label.Parent = Gui
+    local padding = Instance.new("UIPadding")
+    padding.PaddingLeft = UDim.new(0, 8)
+    padding.PaddingRight = UDim.new(0, 6)
+    padding.Parent = label
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = label
+    return label
+end
+local KillsNeededLabel = MakeInfoLabel(
+    "KillsNeededLabel",
+    UDim2.fromOffset(155, 120),
+    UDim2.fromOffset(300, 30)
+)
+local KillsRateLabel = MakeInfoLabel(
+    "KillsRateLabel",
+    UDim2.fromOffset(155, 157),
+    UDim2.fromOffset(340, 30)
+)
+local SessionKillsLabel = MakeInfoLabel(
+    "SessionKillsLabel",
+    UDim2.fromOffset(155, 194),
+    UDim2.fromOffset(260, 30)
+)
+local SessionTimerLabel = MakeInfoLabel(
+    "SessionTimerLabel",
+    UDim2.fromOffset(155, 231),
+    UDim2.fromOffset(340, 30)
+)
+local function MakeModeButton(name, text, position, width)
+    local button = Instance.new("TextButton")
+    button.Name = name
+    button.Size = UDim2.fromOffset(width or 95, 30)
+    button.Position = position
+    button.BackgroundColor3 = Color3.fromRGB(65, 65, 65)
+    button.TextColor3 = Color3.new(1, 1, 1)
+    button.Text = text
+    button.TextSize = 15
+    button.Font = Enum.Font.GothamBold
+    button.Parent = Gui
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = button
+    return button
+end
+local AltButton = MakeModeButton("AltButton", "Alt", UDim2.fromOffset(155, 268))
+local MainButton = MakeModeButton("MainButton", "Main", UDim2.fromOffset(258, 268))
+local KeepScriptButton = MakeModeButton("KeepScriptButton", "Keep: OFF", UDim2.fromOffset(155, 305), 120)
+local AutoRejoinButton = MakeModeButton("AutoRejoinButton", "Rejoin: OFF", UDim2.fromOffset(282, 305), 135)
+KeepScriptButton.TextSize = 13
+AutoRejoinButton.TextSize = 13
+local function UpdateModeButtons()
+    AltButton.BackgroundColor3 = Mode == "Alt"
+        and Color3.fromRGB(55, 145, 90)
+        or Color3.fromRGB(65, 65, 65)
+
+    MainButton.BackgroundColor3 = Mode == "Main"
+        and Color3.fromRGB(55, 145, 90)
+        or Color3.fromRGB(65, 65, 65)
+end
+
+local function StoreExecutorFlag(name, value)
+    pcall(function()
+        ExecutorEnvironment[name] = value
+    end)
+end
+
+local function UpdateUtilityButtons()
+    KeepScriptButton.Text = KeepScriptEnabled and "Keep: ON" or "Keep: OFF"
+    KeepScriptButton.BackgroundColor3 = KeepScriptEnabled
+        and Color3.fromRGB(55, 145, 90)
+        or Color3.fromRGB(65, 65, 65)
+
+    AutoRejoinButton.Text = AutoRejoinEnabled and "Rejoin: ON" or "Rejoin: OFF"
+    AutoRejoinButton.BackgroundColor3 = AutoRejoinEnabled
+        and Color3.fromRGB(55, 145, 90)
+        or Color3.fromRGB(65, 65, 65)
+end
+
+local function ResolveQueueOnTeleport()
+    local queueFunction
+
+    pcall(function()
+        if type(syn) == "table" and type(syn.queue_on_teleport) == "function" then
+            queueFunction = syn.queue_on_teleport
+        end
+    end)
+    if type(queueFunction) ~= "function" and type(queue_on_teleport) == "function" then
+        queueFunction = queue_on_teleport
+    end
+    if type(queueFunction) ~= "function" and type(queueteleport) == "function" then
+        queueFunction = queueteleport
+    end
+    pcall(function()
+        if type(queueFunction) ~= "function"
+            and type(fluxus) == "table"
+            and type(fluxus.queue_on_teleport) == "function" then
+            queueFunction = fluxus.queue_on_teleport
+        end
+    end)
+
+    return queueFunction
+end
+
+local function QueueCurrentScriptForTeleport()
+    -- Auto Rejoin also needs to carry the script and its user configuration back
+    -- into the next session. Keep Script alone can enable the same persistence.
+    if not Running or not (KeepScriptEnabled or AutoRejoinEnabled) then
+        return
+    end
+
+    if type(SCRIPT_RAW_URL) ~= "string"
+        or SCRIPT_RAW_URL == ""
+        or SCRIPT_RAW_URL == "PASTE_RAW_PASTEBIN_URL_HERE"
+        or not SCRIPT_RAW_URL:match("^https?://") then
+        warn("Persistence is enabled, but SCRIPT_RAW_URL needs your raw hosted script URL.")
+        return
+    end
+
+    local queueFunction = ResolveQueueOnTeleport()
+    if type(queueFunction) ~= "function" then
+        warn("Persistence unavailable: this executor does not expose queue_on_teleport.")
+        return
+    end
+
+    -- Serialize the live config so webhook and target choices survive teleport,
+    -- even though those values are intentionally absent from the hosted source.
+    local okConfig, configJson = pcall(function()
+        return HttpService:JSONEncode({
+            WEBHOOK_URL = WEBHOOK_URL,
+            TargetNames = TargetNames,
+        })
+    end)
+    if not okConfig then
+        warn("Could not serialize AltFarm config for teleport: " .. tostring(configJson))
+        return
+    end
+
+    local queueCode = string.format([[
+pcall(function()
+    if type(getgenv) == "function" then getgenv().ALTFARM_LOADED = true end
+end)
+local CoreGui = game:GetService("CoreGui")
+if not game:IsLoaded() then
+    local msg
+    pcall(function()
+        msg = Instance.new("Message")
+        msg.Text = "AltFarm is waiting for the game to load"
+        msg.Parent = CoreGui
+    end)
+    game.Loaded:Wait()
+    if msg then pcall(function() msg:Destroy() end) end
+end
+local HttpService = game:GetService("HttpService")
+local env = _G
+pcall(function()
+    if type(getgenv) == "function" then
+        local candidate = getgenv()
+        if type(candidate) == "table" then env = candidate end
+    end
+end)
+if env["ALT_FARM_ACTIVE_INSTANCE"] == true then return end
+local decodedConfig = HttpService:JSONDecode(%q)
+env[%q] = decodedConfig
+env[%q] = %s
+env[%q] = %s
+local source = game:HttpGet(%q)
+local chunk, loadError = loadstring(source)
+if not chunk then error(loadError) end
+chunk()
+]], configJson, FARM_CONFIG_KEY, KEEP_SCRIPT_FLAG, tostring(KeepScriptEnabled),
+       AUTO_REJOIN_FLAG, tostring(AutoRejoinEnabled), SCRIPT_RAW_URL)
+
+    local ok, err = pcall(function()
+        queueFunction(queueCode)
+    end)
+    if ok then
+        print("AltFarm: queued script, personal settings, and utility toggles for the next teleport.")
+    else
+        warn("AltFarm could not queue reload: " .. tostring(err))
+    end
+end
+
+local AttemptAutoRejoin
+local FallbackToPublicServer
+
+local function DisconnectAutoRejoinMonitor()
+    for _, connection in ipairs(AutoRejoinConnections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+    table.clear(AutoRejoinConnections)
+    table.clear(AutoRejoinWatchedTitles)
+    table.clear(AutoRejoinWatchedPromptGuis)
+    AutoRejoinMonitorActive = false
+end
+
+FallbackToPublicServer = function(attemptGeneration)
+    if not Running or not AutoRejoinEnabled or not AutoRejoinInProgress
+        or attemptGeneration ~= AutoRejoinAttemptGeneration then
+        return
+    end
+    if AutoRejoinFallbackUsed then
+        AutoRejoinInProgress = false
+        return
+    end
+
+    AutoRejoinFallbackUsed = true
+    AutoRejoinPrimarySameServer = false
+    task.delay(0.5, function()
+        if not Running or not AutoRejoinEnabled or not AutoRejoinInProgress
+            or attemptGeneration ~= AutoRejoinAttemptGeneration then
+            return
+        end
+        local ok, err = pcall(function()
+            TeleportService:Teleport(game.PlaceId, Player)
+        end)
+        if not ok then
+            warn("Auto Rejoin fallback failed: " .. tostring(err))
+            AutoRejoinInProgress = false
+        else
+            task.delay(12, function()
+                if Running and AutoRejoinEnabled and AutoRejoinInProgress
+                    and attemptGeneration == AutoRejoinAttemptGeneration
+                    and not AutoRejoinTeleportStarted then
+                    AutoRejoinInProgress = false
+                end
+            end)
+        end
+    end)
+end
+
+AttemptAutoRejoin = function()
+    if not Running or not AutoRejoinEnabled or AutoRejoinInProgress then
+        return
+    end
+
+    AutoRejoinInProgress = true
+    AutoRejoinFallbackUsed = false
+    AutoRejoinTeleportStarted = false
+    AutoRejoinAttemptGeneration += 1
+    local attemptGeneration = AutoRejoinAttemptGeneration
+    local useSameServer = #Players:GetPlayers() > 1 and game.JobId ~= ""
+    AutoRejoinPrimarySameServer = useSameServer
+
+    task.spawn(function()
+        if not Running or not AutoRejoinEnabled
+            or attemptGeneration ~= AutoRejoinAttemptGeneration then
+            AutoRejoinInProgress = false
+            return
+        end
+
+        local ok, err = pcall(function()
+            if useSameServer then
+                TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, Player)
+            else
+                TeleportService:Teleport(game.PlaceId, Player)
+            end
+        end)
+        if not ok then
+            warn("Auto Rejoin request failed: " .. tostring(err))
+            if useSameServer then
+                FallbackToPublicServer(attemptGeneration)
+            else
+                AutoRejoinInProgress = false
+            end
+            return
+        end
+
+        task.delay(12, function()
+            if not Running or not AutoRejoinEnabled or not AutoRejoinInProgress
+                or attemptGeneration ~= AutoRejoinAttemptGeneration
+                or AutoRejoinTeleportStarted then
+                return
+            end
+            if useSameServer then
+                FallbackToPublicServer(attemptGeneration)
+            else
+                AutoRejoinInProgress = false
+            end
+        end)
+    end)
+end
+
+local function WatchErrorTitle(titleObject)
+    if not AutoRejoinEnabled or AutoRejoinWatchedTitles[titleObject] then
+        return
+    end
+    AutoRejoinWatchedTitles[titleObject] = true
+
+    local function CheckTitle()
+        if not Running or not AutoRejoinEnabled or AutoRejoinInProgress then
+            return
+        end
+        local ok, titleText = pcall(function()
+            return titleObject.Text
+        end)
+        if ok and type(titleText) == "string"
+            and titleText:sub(1, 12) == "Disconnected" then
+            AttemptAutoRejoin()
+        end
+    end
+
+    local ok, signal = pcall(function()
+        return titleObject:GetPropertyChangedSignal("Text")
+    end)
+    if ok and signal then
+        table.insert(AutoRejoinConnections, signal:Connect(CheckTitle))
+    end
+    CheckTitle()
+end
+
+local function AttachRobloxPromptGui(promptGui)
+    if not AutoRejoinEnabled or AutoRejoinWatchedPromptGuis[promptGui] then
+        return
+    end
+    AutoRejoinWatchedPromptGuis[promptGui] = true
+
+    for _, descendant in ipairs(promptGui:GetDescendants()) do
+        if descendant.Name == "ErrorTitle" then
+            WatchErrorTitle(descendant)
+        end
+    end
+    table.insert(AutoRejoinConnections, promptGui.DescendantAdded:Connect(function(descendant)
+        if descendant.Name == "ErrorTitle" then
+            WatchErrorTitle(descendant)
+        end
+    end))
+end
+
+local function EnableAutoRejoin()
+    AutoRejoinEnabled = true
+    StoreExecutorFlag(AUTO_REJOIN_FLAG, true)
+
+    if not AutoRejoinMonitorActive then
+        AutoRejoinMonitorActive = true
+        table.insert(AutoRejoinConnections, COREGUI.ChildAdded:Connect(function(child)
+            if child.Name == "RobloxPromptGui" then
+                AttachRobloxPromptGui(child)
+            end
+        end))
+        for _, child in ipairs(COREGUI:GetChildren()) do
+            if child.Name == "RobloxPromptGui" then
+                AttachRobloxPromptGui(child)
+            end
+        end
+        table.insert(AutoRejoinConnections, TeleportService.TeleportInitFailed:Connect(function(failedPlayer)
+            if failedPlayer ~= Player or not Running or not AutoRejoinEnabled
+                or not AutoRejoinInProgress then
+                return
+            end
+            if AutoRejoinPrimarySameServer and not AutoRejoinFallbackUsed then
+                FallbackToPublicServer(AutoRejoinAttemptGeneration)
+            elseif not AutoRejoinFallbackUsed then
+                AutoRejoinInProgress = false
+            end
+        end))
+    end
+
+    UpdateUtilityButtons()
+end
+
+local function DisableAutoRejoin()
+    AutoRejoinEnabled = false
+    StoreExecutorFlag(AUTO_REJOIN_FLAG, false)
+    AutoRejoinInProgress = false
+    AutoRejoinAttemptGeneration += 1
+    DisconnectAutoRejoinMonitor()
+    UpdateUtilityButtons()
+end
+
+-- This listener queues the hosted script and config whenever Keep or Auto Rejoin is enabled.
+PersistenceTeleportConnection = Player.OnTeleport:Connect(function(teleportState)
+    if teleportState == Enum.TeleportState.Started then
+        if AutoRejoinInProgress then
+            AutoRejoinTeleportStarted = true
+        end
+        QueueCurrentScriptForTeleport()
+        -- The old client is leaving; allow exactly one new copy to launch in the next session.
+        pcall(function()
+            ExecutorEnvironment[ACTIVE_SCRIPT_FLAG] = nil
+        end)
+    elseif teleportState == Enum.TeleportState.Failed and AutoRejoinInProgress then
+        if AutoRejoinPrimarySameServer and not AutoRejoinFallbackUsed then
+            FallbackToPublicServer(AutoRejoinAttemptGeneration)
+        elseif not AutoRejoinFallbackUsed then
+            AutoRejoinInProgress = false
+        end
+    end
+end)
+
+UpdateUtilityButtons()
+if AutoRejoinEnabled then
+    EnableAutoRejoin()
+end
+
+-- Interruptible wait
+local function Wait(seconds)
+    local finish = os.clock() + seconds
+    while Running do
+        local remaining = finish - os.clock()
+        if remaining <= 0 then
+            break
+        end
+        task.wait(math.min(0.03, remaining))
+    end
+    return Running
+end
+-- Wait only while Main mode is selected. Mode changes interrupt the current combat cycle.
+local function WaitForMain(seconds)
+    local finish = os.clock() + seconds
+    while Running and Mode == "Main" do
+        local remaining = finish - os.clock()
+        if remaining <= 0 then
+            break
+        end
+        task.wait(math.min(0.03, remaining))
+    end
+    return Running and Mode == "Main"
+end
+local function CancelPendingAltDamageReset()
+    AltDamageResetToken += 1
+    AltDamageResetPending = false
+end
+local function DisconnectAltDamageMonitor()
+    AltDamageMonitorGeneration += 1
+    if AltDamageConnection then
+        pcall(function()
+            AltDamageConnection:Disconnect()
+        end)
+        AltDamageConnection = nil
+    end
+    AltDamageCharacter = nil
+    CancelPendingAltDamageReset()
+end
+-- Watch this character's health. A decrease while Alt mode is selected triggers
+-- a reset; a zero delay sets Health to zero directly in the health-change callback.
+local function MonitorAltDamage(character)
+    AltDamageMonitorGeneration += 1
+    local monitorGeneration = AltDamageMonitorGeneration
+    if AltDamageConnection then
+        pcall(function()
+            AltDamageConnection:Disconnect()
+        end)
+        AltDamageConnection = nil
+    end
+    AltDamageCharacter = character
+    CancelPendingAltDamageReset()
+    if not character then
+        return
+    end
+    task.spawn(function()
+        local humanoid = character:FindFirstChildOfClass("Humanoid")
+            or character:WaitForChild("Humanoid", 10)
+        if not Running
+            or monitorGeneration ~= AltDamageMonitorGeneration
+            or AltDamageCharacter ~= character
+            or Player.Character ~= character
+            or not humanoid then
+            return
+        end
+        local previousHealth = humanoid.Health
+        local connection = humanoid.HealthChanged:Connect(function(newHealth)
+            local tookDamage = newHealth < previousHealth
+            previousHealth = newHealth
+            if not tookDamage
+                or not ALT_RESET_ON_DAMAGE
+                or not Running
+                or Mode ~= "Alt"
+                or Player.Character ~= character
+                or humanoid.Health <= 0
+                or AltDamageResetPending then
+                return
+            end
+            AltDamageResetPending = true
+            AltDamageResetToken += 1
+            local resetToken = AltDamageResetToken
+            local function ResetIfStillValid()
+                if resetToken == AltDamageResetToken
+                    and Running
+                    and ALT_RESET_ON_DAMAGE
+                    and Mode == "Alt"
+                    and Player.Character == character
+                    and humanoid.Parent
+                    and humanoid.Health > 0 then
+                    -- Client-side reset request. The server may override client health.
+                    pcall(function()
+                        humanoid.Health = 0
+                    end)
+                end
+                if resetToken == AltDamageResetToken then
+                    AltDamageResetPending = false
+                end
+            end
+            local delaySeconds = math.max(0, tonumber(ALT_DAMAGE_RESET_DELAY) or 0)
+            if delaySeconds <= 0 then
+                ResetIfStillValid()
+            else
+                task.delay(delaySeconds, ResetIfStillValid)
+            end
+        end)
+        if Running
+            and monitorGeneration == AltDamageMonitorGeneration
+            and AltDamageCharacter == character then
+            AltDamageConnection = connection
+        else
+            connection:Disconnect()
+        end
+    end)
+end
+-- Read comma-formatted or plain numbers embedded in the rank-promotion RichText label.
+local function UpdateKillsNeeded()
+    local text = Goal.Text or ""
+    local numberText = text:match("<font[^>]*>([%d,]+)</font>")
+        or text:match("([%d,]+)%s+[Mm][Oo][Rr][Ee]%s+[Kk][Ii][Ll][Ll][Ss]")
+    if numberText then
+        -- Convert values such as "1,500" into 1500 for reliable numeric formatting.
+        local numericValue = tonumber((numberText:gsub(",", "")))
+        if numericValue then
+            local digits = tostring(math.floor(numericValue))
+            local formatted = digits:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
+            KillsNeededLabel.Text = "Kills needed for rank: " .. formatted
+        else
+            KillsNeededLabel.Text = "Kills needed for rank: unavailable"
+        end
+    else
+        KillsNeededLabel.Text = "Kills needed for rank: unavailable"
+    end
+end
+-- Count kills earned after this script starts; keep the session count cumulative if the game stat resets.
+local sessionStartTime = os.clock()
+local lastObservedTotal = tonumber(TotalKillsStat.Value) or 0
+local sessionKills = 0
+local function UpdateSessionTimer()
+    if not Running then
+        return
+    end
+    local elapsedSeconds = math.max(0, math.floor(os.clock() - sessionStartTime))
+    local days = math.floor(elapsedSeconds / 86400)
+    local hours = math.floor((elapsedSeconds % 86400) / 3600)
+    local minutes = math.floor((elapsedSeconds % 3600) / 60)
+    local seconds = elapsedSeconds % 60
+    SessionTimerLabel.Text = string.format(
+        "Session time: %dd %02dh %02dm %02ds",
+        days,
+        hours,
+        minutes,
+        seconds
+    )
+end
+local function UpdateSessionKillsAndRate()
+    if not Running then
+        return
+    end
+    local currentTotal = tonumber(TotalKillsStat.Value) or lastObservedTotal
+    if currentTotal > lastObservedTotal then
+        sessionKills += currentTotal - lastObservedTotal
+        lastObservedTotal = currentTotal
+    elseif currentTotal < lastObservedTotal then
+        lastObservedTotal = currentTotal
+    end
+    local elapsed = math.max(os.clock() - sessionStartTime, 1)
+    local killsPerMinute = sessionKills * 60 / elapsed
+    local killsPerHour = sessionKills * 3600 / elapsed
+    SessionKillsLabel.Text = string.format("Session kills: %d", sessionKills)
+    KillsRateLabel.Text = string.format(
+        "Kills/min: %.1f  |  Kills/hour: %.0f",
+        killsPerMinute,
+        killsPerHour
+    )
+    UpdateSessionTimer()
+end
+UpdateKillsNeeded()
+UpdateSessionKillsAndRate()
+UpdateSessionTimer()
+table.insert(Connections, Goal:GetPropertyChangedSignal("Text"):Connect(UpdateKillsNeeded))
+table.insert(Connections, TotalKillsStat:GetPropertyChangedSignal("Value"):Connect(UpdateSessionKillsAndRate))
+-- Main-mode webhook reporting. Each entry into Main sends immediately, then every 30 minutes.
+local webhookScheduleGeneration = 0
+local function GetWebhookSessionTime()
+    local elapsedSeconds = math.max(0, math.floor(os.clock() - sessionStartTime))
+    local days = math.floor(elapsedSeconds / 86400)
+    local hours = math.floor((elapsedSeconds % 86400) / 3600)
+    local minutes = math.floor((elapsedSeconds % 3600) / 60)
+    local seconds = elapsedSeconds % 60
+    return string.format("%dd %02dh %02dm %02ds", days, hours, minutes, seconds)
+end
+local function GetKillsNeededForWebhook()
+    local value = KillsNeededLabel.Text:match("^Kills needed for rank:%s*(.+)$")
+    if not value or value == "unavailable" then
+        return "Unavailable"
+    end
+    return value
+end
+local function FormatWebhookNumber(value)
+    local number = math.floor(tonumber(value) or 0)
+    local text = tostring(math.abs(number))
+    local reversed = text:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
+    return (number < 0 and "-" or "") .. reversed
+end
+local function SendMainWebhookUpdate()
+    if not Running or Mode ~= "Main" then
+        return
+    end
+    local elapsed = math.max(os.clock() - sessionStartTime, 1)
+    local killsPerHour = sessionKills * 3600 / elapsed
+    local rankValue = GetKillsNeededForWebhook()
+    if rankValue ~= "Unavailable" then
+        -- Keep the already-formatted leaderboard value (e.g. "1,500").
+        rankValue = rankValue:gsub("^%s+", ""):gsub("%s+$", "")
+    end
+    local payload = {
+        username = "Farm Monitor",
+        embeds = {{
+            title = "Farming Session Report",
+            description = "A quick snapshot of your current progress.",
+            color = 0x8B5CF6,
+            fields = {
+                {
+                    name = "👤  User",
+                    value = tostring(Player.DisplayName),
+                    inline = true,
+                },
+                {
+                    name = "🏆  Kills needed for rank",
+                    value = "**" .. rankValue .. "**",
+                    inline = true,
+                },
+                {
+                    name = "💀  Session kills gained",
+                    value = "**" .. FormatWebhookNumber(sessionKills) .. "**",
+                    inline = true,
+                },
+                {
+                    name = "⏱️  Session time",
+                    value = "`" .. GetWebhookSessionTime() .. "`",
+                    inline = true,
+                },
+                {
+                    name = "⚡  Average kills per hour",
+                    value = "**" .. FormatWebhookNumber(killsPerHour) .. "**",
+                    inline = true,
+                },
+            },
+            timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        }},
+    }
+    -- Executor-provided HTTP request functions vary by environment.
+    local requestFunction = request or http_request or (syn and syn.request)
+    if type(requestFunction) ~= "function" then
+        warn("Webhook not sent: this environment does not expose request/http_request/syn.request.")
+        return
+    end
+    local okEncode, body = pcall(function()
+        return HttpService:JSONEncode(payload)
+    end)
+    if not okEncode then
+        warn("Webhook not sent: failed to encode payload: " .. tostring(body))
+        return
+    end
+    task.spawn(function()
+        -- Do not send if the user switched away from Main before the request starts.
+        if not Running or Mode ~= "Main" then
+            return
+        end
+        local success, response = pcall(function()
+            return requestFunction({
+                Url = WEBHOOK_URL,
+                Method = "POST",
+                Headers = { ["Content-Type"] = "application/json" },
+                Body = body,
+            })
+        end)
+        if success then
+            local statusCode = response and (response.StatusCode or response.Status)
+            print("Webhook sent. Response code: " .. tostring(statusCode or "unknown"))
+        else
+            warn("Webhook request failed: " .. tostring(response))
+        end
+    end)
+end
+local function CancelMainWebhookSchedule()
+    webhookScheduleGeneration += 1
+end
+local function StartMainWebhookSchedule()
+    webhookScheduleGeneration += 1
+    local myGeneration = webhookScheduleGeneration
+    task.spawn(function()
+        -- Immediate report on entering Main.
+        if Running and Mode == "Main" and myGeneration == webhookScheduleGeneration then
+            SendMainWebhookUpdate()
+        end
+        while Running and Mode == "Main" and myGeneration == webhookScheduleGeneration do
+            if not WaitForMain(WEBHOOK_INTERVAL_SECONDS) then
+                break
+            end
+            if Running and Mode == "Main" and myGeneration == webhookScheduleGeneration then
+                SendMainWebhookUpdate()
+            end
+        end
+    end)
+end
+-- Virtual mouse input
+local function Mouse(down)
+    if not Running and down then
+        return
+    end
+    local position = UserInputService:GetMouseLocation()
+    pcall(function()
+        VirtualInputManager:SendMouseButtonEvent(
+            position.X,
+            position.Y,
+            0,
+            down,
+            game
+        )
+    end)
+    MouseHeld = down
+end
+-- Virtual keyboard input
+local function Key(keyCode, down)
+    if not Running and down then
+        return
+    end
+    pcall(function()
+        VirtualInputManager:SendKeyEvent(down, keyCode, false, game)
+    end)
+    if down then
+        HeldKeys[keyCode] = true
+    else
+        HeldKeys[keyCode] = nil
+    end
+end
+-- Anti-AFK. Prefer executor connection controls; use VirtualUser as a fallback.
+-- Connections disabled with :Disable() are restored when STOP is pressed.
+local DisabledIdleConnections = {}
+local function SetupAntiAFK()
+    if not ANTI_AFK_ENABLED then
+        return
+    end
+    local GC = getconnections or get_signal_cons
+    if type(GC) == "function" then
+        local ok, idleConnections = pcall(GC, Player.Idled)
+        if ok and type(idleConnections) == "table" then
+            for _, connection in pairs(idleConnections) do
+                pcall(function()
+                    if type(connection.Disable) == "function" then
+                        local wasEnabled
+                        pcall(function()
+                            wasEnabled = connection.Enabled
+                        end)
+                        -- Leave connections that were already disabled alone.
+                        if wasEnabled ~= false then
+                            connection:Disable()
+                            table.insert(DisabledIdleConnections, {
+                                connection = connection,
+                                wasEnabled = wasEnabled,
+                            })
+                        end
+                    elseif type(connection.Disconnect) == "function" then
+                        -- Some executor connection wrappers only expose Disconnect.
+                        connection:Disconnect()
+                    end
+                end)
+            end
+            return
+        end
+    end
+    -- Fallback for environments without getconnections/get_signal_cons.
+    local VirtualUser = game:GetService("VirtualUser")
+    local fallbackConnection = Player.Idled:Connect(function()
+        if not Running or not ANTI_AFK_ENABLED then
+            return
+        end
+        pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new())
+        end)
+    end)
+    table.insert(Connections, fallbackConnection)
+end
+SetupAntiAFK()
+-- Left mouse hold for 50ms; stop the hold if the user switches out of Main mode.
+local function Click50ms()
+    if not Running or Mode ~= "Main" then
+        return false
+    end
+    Mouse(true)
+    local finish = os.clock() + 0.005
+    while Running and Mode == "Main" do
+        local remaining = finish - os.clock()
+        if remaining <= 0 then
+            break
+        end
+        task.wait(math.min(0.01, remaining))
+    end
+    Mouse(false)
+    return Running and Mode == "Main"
+end
+-- Brief key tap
+local function TapKey(keyCode)
+    if not Running or Mode ~= "Main" then
+        return false
+    end
+    -- Keep following this same locked target after the key press.
+    -- The heartbeat loop stops only when this target dies/despawns; a new
+    -- target can be selected only when the next skill attempt begins.
+    Key(keyCode, true)
+    TargetTeleporting = TargetLockedForSkill ~= nil
+    TargetEngaged = TargetLockedForSkill ~= nil
+    task.wait()
+    Key(keyCode, false)
+    return Running and Mode == "Main"
+end
+-- Find the oldest-spawned target who is alive now and has been alive for at least TARGET_ALIVE_SECONDS seconds.
+local function GetOldestAliveTarget()
+    local candidates = {}
+    local now = os.clock()
+    for _, username in ipairs(TargetNames) do
+        local targetPlayer = Players:FindFirstChild(username)
+        if targetPlayer then
+            TrackTarget(targetPlayer)
+            local character = targetPlayer.Character
+            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+            local root = character and character:FindFirstChild("HumanoidRootPart")
+            local aliveSince = AliveSince[targetPlayer]
+            -- If health is positive but tracking just started, start the alive timer now.
+            if character and humanoid and humanoid.Health > 0 and not aliveSince then
+                aliveSince = now
+                AliveSince[targetPlayer] = aliveSince
+            end
+            if character and humanoid and humanoid.Health > 0
+                and root and root:IsA("BasePart")
+                and aliveSince and (now - aliveSince) >= TARGET_ALIVE_SECONDS then
+                table.insert(candidates, {
+                    player = targetPlayer,
+                    character = character,
+                    humanoid = humanoid,
+                    root = root,
+                    spawnTime = SpawnTimes[targetPlayer] or StartupTime,
+                    aliveSince = aliveSince
+                })
+            end
+        end
+    end
+    if #candidates == 0 then
+        return nil
+    end
+    -- Earlier character spawn time wins; ties preserve TargetNames order.
+    local chosen = candidates[1]
+    for i = 2, #candidates do
+        if candidates[i].spawnTime < chosen.spawnTime then
+            chosen = candidates[i]
+        end
+    end
+    return chosen
+end
+-- Teleport the local character's HumanoidRootPart to an exact staging position while preserving rotation.
+local function TeleportLocalToStaging()
+    if not Running then
+        return false
+    end
+    local character = Player.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not character or not humanoid or humanoid.Health <= 0
+        or not root or not root:IsA("BasePart") then
+        return false
+    end
+    -- Alt mode places each character only once per life. Once placed, do not
+    -- re-check nearby players or move this character if someone approaches.
+    if Mode == "Alt" and AltStageTeleportedCharacter == character then
+        return true
+    end
+    -- Choose and cache the position for this character. If no safe location
+    -- can be found initially, later attempts may retry until one is available.
+    local stagingPosition = GetStagingPositionForCharacter(character)
+    if not stagingPosition then
+        return false
+    end
+    -- Preserve the existing dynamic re-check behavior for Main mode only.
+    -- Alt mode intentionally keeps its first safe position for the whole life.
+    if USE_VOID_STAGE and Mode == "Main" then
+        local otherRoots = GetOtherLivingPlayerRoots()
+        if not IsSafeVoidPosition(
+            stagingPosition,
+            otherRoots,
+            VOID_STAGE_MIN_PLAYER_DISTANCE
+        ) then
+            stagingPosition = ChooseSafeVoidPosition()
+            CurrentStagingPosition = stagingPosition
+            StagingPositionCharacter = character
+            -- In a crowded server, retry later rather than teleporting to a
+            -- position that failed the minimum-distance check.
+            if not stagingPosition then
+                return false
+            end
+        end
+    end
+    local rootRotation = root.CFrame - root.Position
+    local desiredRootCFrame = CFrame.new(stagingPosition) * rootRotation
+    local pivotOffset = root.CFrame:ToObjectSpace(character:GetPivot())
+    local success = pcall(function()
+        character:PivotTo(desiredRootCFrame * pivotOffset)
+    end)
+    if success and Mode == "Alt" then
+        AltStageTeleportedCharacter = character
+    end
+    return success
+end
+-- Teleport behind a selected target, one stud back, matching target root rotation.
+local function TeleportBehindTarget(chosen)
+    if not Running or Mode ~= "Main" then
+        return false
+    end
+    local character = Player.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not character or not humanoid or humanoid.Health <= 0
+        or not root or not root:IsA("BasePart") then
+        return false
+    end
+    local myY = root.Position.Y
+    local deepVoidOverride = myY < TARGET_TELEPORT_DEEP_VOID_OVERRIDE_Y
+    -- Pause while between Y=-500 and Y=-550, then allow target-following to
+    -- resume below Y=-550, even if the regular void/death phase is active.
+    if myY < TARGET_TELEPORT_BLOCK_Y and not deepVoidOverride then
+        return false
+    end
+    if not deepVoidOverride and (not TargetTeleporting or InVoidPhase) then
+        return false
+    end
+    if deepVoidOverride then
+        TargetTeleporting = true
+    end
+    if not chosen then
+        chosen = TargetLockedForSkill
+    end
+    if not chosen
+        or chosen.player.Character ~= chosen.character
+        or chosen.humanoid.Health <= 0
+        or not chosen.root.Parent then
+        return false
+    end
+    local aliveSince = AliveSince[chosen.player]
+    if not aliveSince or (os.clock() - aliveSince) < TARGET_ALIVE_SECONDS then
+        return false
+    end
+    -- Local +Z is behind the target's facing direction.
+    local desiredRootCFrame = chosen.root.CFrame * CFrame.new(0, 0, 1)
+    local pivotOffset = root.CFrame:ToObjectSpace(character:GetPivot())
+    local success = pcall(function()
+        character:PivotTo(desiredRootCFrame * pivotOffset)
+    end)
+    TargetEngaged = success
+    return success
+end
+-- Lock one eligible target for this skill attempt. The background loop keeps
+-- following this same target after the key press until it dies/despawns; a
+-- different target can only be selected at the next skill attempt.
+local function TeleportThenTapKey(keyCode)
+    if not Running or Mode ~= "Main" then
+        return false
+    end
+    TargetTeleporting = false
+    TargetLockedForSkill = nil
+    TargetEngaged = false
+    while Running and Mode == "Main" and not InVoidPhase do
+        local chosen = GetOldestAliveTarget()
+        if chosen then
+            TargetLockedForSkill = chosen
+            TargetTeleporting = true
+            TargetEngaged = true
+            if TeleportBehindTarget(chosen) then
+                if not WaitForMain(0.2) then
+                    TargetTeleporting = false
+                    TargetLockedForSkill = nil
+                    return false
+                end
+                -- Do not reselect a different target here. Keep the same target
+                -- locked during the pre-skill wait. If it has moved/died, the
+                -- final teleport will simply fail and the scheduled key still fires.
+                if chosen.player.Character == chosen.character
+                    and chosen.humanoid.Parent
+                    and chosen.humanoid.Health > 0
+                    and chosen.root.Parent
+                    and AliveSince[chosen.player]
+                    and (os.clock() - AliveSince[chosen.player]) >= TARGET_ALIVE_SECONDS then
+                    TeleportBehindTarget(chosen)
+                end
+                return TapKey(keyCode)
+            else
+                TargetTeleporting = false
+                TargetLockedForSkill = nil
+                TargetEngaged = false
+            end
+        else
+            TargetTeleporting = false
+            TargetLockedForSkill = nil
+            TargetEngaged = false
+        end
+        if not WaitForMain(0.05) then
+            TargetTeleporting = false
+            TargetLockedForSkill = nil
+            return false
+        end
+    end
+    TargetTeleporting = false
+    TargetLockedForSkill = nil
+    return false
+end
+local function RestoreAltAutoRotate()
+    for humanoid, state in pairs(AltAutoRotateStates) do
+        if humanoid and humanoid.Parent then
+            humanoid.AutoRotate = state.autoRotate
+        end
+        AltAutoRotateStates[humanoid] = nil
+    end
+end
+local function StopAltAnimation()
+    local track = AltAnimationTrack
+    local animationObject = AltAnimationObject
+    AltAnimationTrack = nil
+    AltAnimationObject = nil
+    AltAnimationCharacter = nil
+    if track then
+        pcall(function()
+            track:Stop(0)
+        end)
+        pcall(function()
+            track:Destroy()
+        end)
+    end
+    if animationObject then
+        pcall(function()
+            animationObject:Destroy()
+        end)
+    end
+end
+local function EnsureAltAnimation(character, humanoid)
+    if AltAnimationTrack and AltAnimationCharacter == character then
+        return AltAnimationTrack
+    end
+    StopAltAnimation()
+    if not character or not humanoid or not humanoid.Parent then
+        return nil
+    end
+    local animator = humanoid:FindFirstChildOfClass("Animator")
+    if not animator then
+        -- A local Animator permits local playback if this character has none.
+        animator = Instance.new("Animator")
+        animator.Parent = humanoid
+    end
+    local animationObject = Instance.new("Animation")
+    animationObject.Name = "AltSemiInvisibility"
+    animationObject.AnimationId = ALT_ANIMATION_ID
+    local ok, track = pcall(function()
+        return animator:LoadAnimation(animationObject)
+    end)
+    if not ok or not track then
+        animationObject:Destroy()
+        return nil
+    end
+    track.Priority = Enum.AnimationPriority.Action4
+    track.Looped = true
+    local playOk = pcall(function()
+        track:Play(0, 1, 1)
+    end)
+    if not playOk then
+        pcall(function() track:Destroy() end)
+        animationObject:Destroy()
+        return nil
+    end
+    AltAnimationTrack = track
+    AltAnimationObject = animationObject
+    AltAnimationCharacter = character
+    AltAnimationLengthWarned = false
+    return track
+end
+-- While Alt is selected, stop every other playing animation track on the
+-- character. This runs every rendered frame so newly started tracks are also
+-- cleared, while leaving the Semi-Invisibility track untouched.
+local function ClearOtherPlayingAnimations(character, keepTrack)
+    if not character or not keepTrack then
+        return
+    end
+    for _, object in ipairs(character:GetDescendants()) do
+        if object:IsA("Animator") then
+            local ok, tracks = pcall(function()
+                return object:GetPlayingAnimationTracks()
+            end)
+            if ok and tracks then
+                for _, otherTrack in ipairs(tracks) do
+                    if otherTrack ~= keepTrack then
+                        pcall(function()
+                            otherTrack:Stop(0)
+                        end)
+                    end
+                end
+            end
+        end
+    end
+end
+local function UpdateAltAnimation(character, humanoid)
+    local track = EnsureAltAnimation(character, humanoid)
+    if not track then
+        return
+    end
+    if not track.IsPlaying then
+        pcall(function()
+            track:Play(0, 1, 1)
+        end)
+    end
+    -- Keep the requested animation playing and pinned at 11.2s every rendered frame.
+    local length = track.Length
+    if length > 0 then
+        if length >= ALT_ANIMATION_TIME_POSITION then
+            pcall(function()
+                track.TimePosition = ALT_ANIMATION_TIME_POSITION
+            end)
+        elseif not AltAnimationLengthWarned then
+            AltAnimationLengthWarned = true
+            warn(string.format(
+                "Alt animation length is %.2fs, shorter than requested position %.2fs; it cannot be pinned at that position.",
+                length,
+                ALT_ANIMATION_TIME_POSITION
+            ))
+        end
+    end
+    -- Only called by the Alt-mode render-step branch, so Main's animations
+    -- are not touched. Re-enforcing this every frame removes other animations
+    -- that the default Animate script or another local script tries to play.
+    ClearOtherPlayingAnimations(character, track)
+end
+-- Bind at the end of the render step so shift-lock / default character rotation
+-- is overridden while Alt is selected. The Alt animation is also pinned every frame.
+RunService:BindToRenderStep(
+    AltSpinBindingName,
+    Enum.RenderPriority.Last.Value,
+    function(deltaTime)
+        if not Running then
+            return
+        end
+        if Mode ~= "Alt" then
+            RestoreAltAutoRotate()
+            StopAltAnimation()
+            return
+        end
+        local character = Player.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        if humanoid then
+            if not AltAutoRotateStates[humanoid] then
+                AltAutoRotateStates[humanoid] = {
+                    autoRotate = humanoid.AutoRotate
+                }
+            end
+            humanoid.AutoRotate = false
+            UpdateAltAnimation(character, humanoid)
+        else
+            StopAltAnimation()
+        end
+        if root and root:IsA("BasePart") then
+            AltSpinAngle = (AltSpinAngle + deltaTime * ALT_SPIN_RADIANS_PER_SECOND) % (math.pi * 2)
+            local position = root.Position
+            root.CFrame = CFrame.new(position) * CFrame.Angles(0, AltSpinAngle, 0)
+        end
+        -- Alt-only velocity suppression: clear linear and angular assembly
+        -- velocity on every character BasePart every rendered frame.
+        if character then
+            for _, descendant in ipairs(character:GetDescendants()) do
+                if descendant:IsA("BasePart") then
+                    descendant.AssemblyLinearVelocity = Vector3.zero
+                    descendant.AssemblyAngularVelocity = Vector3.zero
+                end
+            end
+        end
+    end
+)
+local function SetMode(newMode)
+    if not Running or (newMode ~= "Main" and newMode ~= "Alt") then
+        return
+    end
+    local previousMode = Mode
+    if previousMode == newMode then
+        return
+    end
+    Mode = newMode
+    TargetEngaged = false
+    TargetLockedForSkill = nil
+    TargetTeleporting = false
+    if Mode == "Main" then
+        CancelPendingAltDamageReset()
+        StopAltAnimation()
+        RestoreAltAutoRotate()
+        StartMainWebhookSchedule()
+    else
+        -- Stop future reports immediately when leaving Main.
+        CancelMainWebhookSchedule()
+        -- If switching to Alt during the void phase, let the Alt staging loop take over.
+        InVoidPhase = false
+    end
+    UpdateModeButtons()
+    if Mode == "Alt" then
+        TeleportLocalToStaging()
+    end
+end
+ table.insert(Connections, AltButton.Activated:Connect(function()
+    SetMode("Alt")
+end))
+table.insert(Connections, MainButton.Activated:Connect(function()
+    SetMode("Main")
+end))
+table.insert(Connections, KeepScriptButton.Activated:Connect(function()
+    KeepScriptEnabled = not KeepScriptEnabled
+    StoreExecutorFlag(KEEP_SCRIPT_FLAG, KeepScriptEnabled)
+    UpdateUtilityButtons()
+    if KeepScriptEnabled then
+        if SCRIPT_RAW_URL == "PASTE_RAW_PASTEBIN_URL_HERE" then
+            warn("Persistence is on, but SCRIPT_RAW_URL still needs your raw Pastebin URL.")
+        elseif type(ResolveQueueOnTeleport()) ~= "function" then
+            warn("Persistence is on, but this executor does not expose queue_on_teleport.")
+        end
+    end
+end))
+table.insert(Connections, AutoRejoinButton.Activated:Connect(function()
+    if AutoRejoinEnabled then
+        DisableAutoRejoin()
+    else
+        EnableAutoRejoin()
+    end
+end))
+UpdateModeButtons()
+UpdateUtilityButtons()
+-- Start damage monitoring for the character already present when the script runs.
+if Player.Character then
+    RefreshStagingPositionForCharacter(Player.Character)
+    MonitorAltDamage(Player.Character)
+end
+-- Teleport the local character to staging as soon as they respawn when the selected mode calls for it.
+table.insert(Connections, Player.CharacterAdded:Connect(function(character)
+    TargetEngaged = false
+    TargetTeleporting = false
+    TargetLockedForSkill = nil
+    AltAliveFailsafeCharacter = character
+    AltAliveSince = os.clock()
+    AltAliveResetTriggered = false
+    StopAltAnimation()
+    RefreshStagingPositionForCharacter(character)
+    MonitorAltDamage(character)
+    task.spawn(function()
+        local root = character:WaitForChild("HumanoidRootPart", 10)
+        if not root or not Running or Player.Character ~= character then
+            return
+        end
+        if InVoidPhase then
+            return
+        end
+        if Mode == "Alt" then
+            TeleportLocalToStaging()
+        elseif Mode == "Main" and not GetOldestAliveTarget() then
+            TeleportLocalToStaging()
+        end
+    end)
+end))
+-- Alt-only alive-duration failsafe. It issues at most one reset per character
+-- life, and a respawn starts the timer from zero. Main mode never triggers it.
+task.spawn(function()
+    while Running do
+        local character = Player.Character
+        if character then
+            if AltAliveFailsafeCharacter ~= character then
+                AltAliveFailsafeCharacter = character
+                AltAliveSince = os.clock()
+                AltAliveResetTriggered = false
+            end
+
+            if ALT_ALIVE_FAILSAFE_ENABLED
+                and Mode == "Alt"
+                and not AltAliveResetTriggered
+                and AltAliveSince
+                and (os.clock() - AltAliveSince) >= ALT_MAX_ALIVE_SECONDS then
+
+                local humanoid = character:FindFirstChildOfClass("Humanoid")
+                if humanoid and humanoid.Health > 0 then
+                    -- This is a client-side reset attempt; server authority may override it.
+                    AltAliveResetTriggered = true
+                    pcall(function()
+                        humanoid:SetStateEnabled(Enum.HumanoidStateType.Dead, true)
+                        humanoid:ChangeState(Enum.HumanoidStateType.Dead)
+                        humanoid.Health = 0
+                    end)
+                end
+            end
+        end
+
+        if not Wait(0.25) then
+            break
+        end
+    end
+end)
+
+-- STOP everything; destroying the GUI clears the stats and mode buttons too.
+local function Stop()
+    if not Running then
+        return
+    end
+    Running = false
+    pcall(function()
+        ExecutorEnvironment[ACTIVE_SCRIPT_FLAG] = nil
+    end)
+    CancelMainWebhookSchedule()
+
+    -- STOP really stops the script: no persistence queue or auto-rejoin after this point.
+    KeepScriptEnabled = false
+    StoreExecutorFlag(KEEP_SCRIPT_FLAG, false)
+    DisableAutoRejoin()
+    if PersistenceTeleportConnection then
+        pcall(function()
+            PersistenceTeleportConnection:Disconnect()
+        end)
+        PersistenceTeleportConnection = nil
+    end
+
+    TargetTeleporting = false
+    TargetLockedForSkill = nil
+    TargetEngaged = false
+    DisconnectAltDamageMonitor()
+    StopAltAnimation()
+    RestoreAltAutoRotate()
+    pcall(function()
+        RunService:UnbindFromRenderStep(AltSpinBindingName)
+    end)
+    if MouseHeld then
+        Mouse(false)
+    end
+    for keyCode in pairs(HeldKeys) do
+        pcall(function()
+            VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
+        end)
+        HeldKeys[keyCode] = nil
+    end
+    for _, connection in ipairs(Connections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+    -- Restore Idled connections that were disabled by this script, when supported.
+    for _, entry in ipairs(DisabledIdleConnections) do
+        if entry.wasEnabled ~= false then
+            pcall(function()
+                if type(entry.connection.Enable) == "function" then
+                    entry.connection:Enable()
+                end
+            end)
+        end
+    end
+    table.clear(DisabledIdleConnections)
+    Gui:Destroy()
+end
+table.insert(Connections, StopButton.Activated:Connect(Stop))
+-- Emote Spin remote loop: active in Main mode only.
+task.spawn(function()
+    while Running do
+        if Mode == "Main" and not InVoidPhase then
+            local character = Player.Character
+            local event = character and character:FindFirstChild("Communicate")
+            if event and event:IsA("RemoteEvent") then
+                pcall(function()
+                    event:FireServer({ Goal = "Emote Spin" })
+                end)
+            end
+        end
+        if not Wait(1) then
+            break
+        end
+    end
+end)
+-- Update elapsed-time rate at least once per second.
+task.spawn(function()
+    while Running do
+        UpdateSessionKillsAndRate()
+        UpdateSessionTimer()
+        if not Wait(1) then
+            break
+        end
+    end
+end)
+-- Main target teleporter: continuously follow the one target locked for the
+-- current skill. It does not choose another target independently. The loop
+-- stops following as soon as that target dies, despawns, or respawns. Falling
+-- below Y=-550 re-enables following for the same locked target as requested.
+task.spawn(function()
+    while Running do
+        if Mode == "Main" then
+            local character = Player.Character
+            local root = character and character:FindFirstChild("HumanoidRootPart")
+            local deepVoidOverride = root
+                and root:IsA("BasePart")
+                and root.Position.Y < TARGET_TELEPORT_DEEP_VOID_OVERRIDE_Y
+            if (TargetTeleporting and not InVoidPhase) or deepVoidOverride then
+                local chosen = TargetLockedForSkill
+                if chosen then
+                    local targetStillAlive =
+                        chosen.player.Character == chosen.character
+                        and chosen.humanoid
+                        and chosen.humanoid.Parent ~= nil
+                        and chosen.humanoid.Health > 0
+                        and chosen.root
+                        and chosen.root.Parent ~= nil
+                    if targetStillAlive then
+                        -- TeleportBehindTarget reapplies the target's full root
+                        -- CFrame every Heartbeat, matching position and rotation.
+                        TeleportBehindTarget(chosen)
+                    elseif TargetLockedForSkill == chosen then
+                        TargetTeleporting = false
+                        TargetLockedForSkill = nil
+                        TargetEngaged = false
+                    end
+                else
+                    TargetTeleporting = false
+                    TargetEngaged = false
+                end
+            end
+        end
+        if TARGET_TELEPORT_INTERVAL <= 0 then
+            RunService.Heartbeat:Wait()
+        elseif not Wait(TARGET_TELEPORT_INTERVAL) then
+            break
+        end
+    end
+end)
+-- Staging loop:
+-- Alt mode teleports once per character life, using one cached safe position.
+-- Main mode retains its existing staging behavior while waiting for a target.
+task.spawn(function()
+    while Running do
+        if not InVoidPhase then
+            if Mode == "Alt" then
+                TargetEngaged = false
+                local character = Player.Character
+                if character and AltStageTeleportedCharacter ~= character then
+                    TeleportLocalToStaging()
+                end
+            elseif Mode == "Main" and not TargetEngaged then
+                if not GetOldestAliveTarget() then
+                    TeleportLocalToStaging()
+                end
+            end
+        end
+        if STAGING_INTERVAL <= 0 then
+            -- Avoid a tight loop: zero-delay staging runs once per physics frame.
+            RunService.Heartbeat:Wait()
+        else
+            if not Wait(STAGING_INTERVAL) then
+                break
+            end
+        end
+    end
+end)
+local function RunMainCycle()
+    if not Running or Mode ~= "Main" then
+        return false
+    end
+    -- Wait for a target to have been alive >= TARGET_ALIVE_SECONDS seconds, teleport behind them, wait 0.2s, press 2.
+    if not TeleportThenTapKey(Enum.KeyCode.Two) then
+        return false
+    end
+    if not WaitForMain(2.2) then
+        return false
+    end
+    -- Wait for a target to have been alive >= TARGET_ALIVE_SECONDS seconds, teleport behind them, wait 0.2s, press 1.
+    if not TeleportThenTapKey(Enum.KeyCode.One) then
+        return false
+    end
+    if not WaitForMain(2.45) then
+        return false
+    end
+    -- Pause target teleporting before entering the void.
+    InVoidPhase = true
+    TargetTeleporting = false
+    TargetEngaged = false
+    local character = Player.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if character and humanoid and humanoid.RigType == Enum.HumanoidRigType.R6 then
+        pcall(function()
+            character:PivotTo(character:GetPivot() + Vector3.new(0, -500, 0))
+        end)
+        -- Try both death mechanisms repeatedly for the configured duration.
+        -- ChangeState(Dead) is the important addition; Health is also set to 0
+        -- in case the experience's local character scripts rely on that path.
+        local deadState = Enum.HumanoidStateType.Dead
+        pcall(function()
+            humanoid:SetStateEnabled(deadState, true)
+        end)
+        local deathDeadline = os.clock() + MAIN_VOID_HEALTH_ZERO_DURATION
+        while Running
+            and Mode == "Main"
+            and Player.Character == character
+            and humanoid.Parent
+            and os.clock() < deathDeadline do
+            pcall(function()
+                humanoid:SetStateEnabled(deadState, true)
+                humanoid:ChangeState(deadState)
+                humanoid.Health = 0
+            end)
+            RunService.Heartbeat:Wait()
+        end
+    end
+    -- Wait 5.7 seconds before the next cycle; a mode switch interrupts this wait.
+    local completed = WaitForMain(5.7)
+    InVoidPhase = false
+    -- The following target is not acquired until the next scheduled skill press.
+    TargetTeleporting = false
+    TargetLockedForSkill = nil
+    TargetEngaged = false
+    return completed
+end
+-- Main automation loop. Selecting Alt pauses combat; selecting Main resumes it.
+task.spawn(function()
+    while Running do
+        if Mode == "Main" then
+            RunMainCycle()
+        else
+            if not Wait(0.05) then
+                break
+            end
+        end
+    end
+end)
