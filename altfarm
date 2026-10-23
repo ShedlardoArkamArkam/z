@@ -30,8 +30,9 @@ local TeleportService = game:GetService("TeleportService")
 local Player = Players.LocalPlayer
 local PlayerGui = Player:WaitForChild("PlayerGui")
 
--- Raw host URL used for the launcher and queued teleport reloads.
-local SCRIPT_RAW_URL = "https://raw.githubusercontent.com/ShedlardoArkamArkam/z/refs/heads/main/altfarm"
+-- Raw host URL used for queued teleport reloads. Bump this query value when publishing
+-- a new hosted revision so cached raw responses don't keep an older script running.
+local SCRIPT_RAW_URL = "https://raw.githubusercontent.com/ShedlardoArkamArkam/z/refs/heads/main/altfarm?altfarm_version=20261023c"
 local FARM_CONFIG_KEY = "ALT_FARM_CONFIG"
 local KEEP_SCRIPT_FLAG = "ALT_FARM_KEEP_SCRIPT_ENABLED"
 local AUTO_REJOIN_FLAG = "ALT_FARM_AUTO_REJOIN_ENABLED"
@@ -167,10 +168,10 @@ pcall(function()
     ExecutorEnvironment[MODE_FLAG] = Mode
 end)
 
--- One-time migration: turn Keep Script and Auto Rejoin on when this version
--- is first installed, even if an earlier version left stale false flags behind.
--- After migration, explicit user toggles persist across executions/teleports.
-local UTILITY_DEFAULTS_VERSION = 1
+-- One-time migration for this repair: restore Keep Script and Auto Rejoin to ON
+-- even if the previous broken Stop left stale OFF flags in the executor environment.
+-- After this migration, explicit user toggles persist across supported teleports.
+local UTILITY_DEFAULTS_VERSION = 2
 if ExecutorEnvironment[UTILITY_DEFAULTS_VERSION_FLAG] ~= UTILITY_DEFAULTS_VERSION then
     pcall(function()
         ExecutorEnvironment[KEEP_SCRIPT_FLAG] = true
@@ -1210,23 +1211,18 @@ local function GetNextLeaderboardTarget(currentKills)
         return nil, nil, nil, "Waiting for leaderboard"
     end
 
-    local targetRank = 15
+    -- Need one more kill than a cutoff to be above it. Equality still targets
+    -- that rank; only a strictly greater Kills value advances to the next rank.
     for rank = 15, 1, -1 do
-        if currentKills >= values[rank] then
-            targetRank = rank - 1
-        else
-            targetRank = rank
-            break
+        local cutoff = values[rank]
+        if currentKills <= cutoff then
+            local killsNeeded = math.max(0, cutoff + 1 - currentKills)
+            return rank, cutoff, killsNeeded, nil
         end
     end
 
-    if targetRank <= 0 then
-        return 1, values[1], 0, "Reached"
-    end
-
-    local cutoff = values[targetRank]
-    local killsNeeded = math.max(0, cutoff + 1 - currentKills)
-    return targetRank, cutoff, killsNeeded, nil
+    -- The current Kills stat is strictly above the displayed Top 1 cutoff.
+    return 1, values[1], 0, "Reached"
 end
 
 local nextLeaderboardRank = nil
@@ -1289,6 +1285,9 @@ task.spawn(function()
     end
 end)
 
+-- Generation token used to invalidate old Main-mode webhook loops safely.
+local webhookScheduleGeneration = 0
+
 local function GetWebhookSessionTime()
     local elapsedSeconds = math.max(0, math.floor(os.clock() - sessionStartTime))
     local days = math.floor(elapsedSeconds / 86400)
@@ -1311,9 +1310,6 @@ local function GetPlayerTotalKills(player)
         return nil
     end
     local stat = stats:FindFirstChild("Total Kills")
-    if not stat then
-        stat = stats:FindFirstChild("Kills")
-    end
     return stat and tonumber(stat.Value) or nil
 end
 
@@ -1458,7 +1454,18 @@ local function SendMainWebhookUpdate()
         }},
     }
     -- Executor-provided HTTP request functions vary by environment.
-    local requestFunction = request or http_request or (syn and syn.request)
+    local requestFunction = nil
+    if type(request) == "function" then
+        requestFunction = request
+    elseif type(http_request) == "function" then
+        requestFunction = http_request
+    else
+        pcall(function()
+            if type(syn) == "table" and type(syn.request) == "function" then
+                requestFunction = syn.request
+            end
+        end)
+    end
     if type(requestFunction) ~= "function" then
         warn("Webhook not sent: this environment does not expose request/http_request/syn.request.")
         return
