@@ -35,6 +35,8 @@ local SCRIPT_RAW_URL = "https://raw.githubusercontent.com/ShedlardoArkamArkam/z/
 local FARM_CONFIG_KEY = "ALT_FARM_CONFIG"
 local KEEP_SCRIPT_FLAG = "ALT_FARM_KEEP_SCRIPT_ENABLED"
 local AUTO_REJOIN_FLAG = "ALT_FARM_AUTO_REJOIN_ENABLED"
+local MODE_FLAG = "ALT_FARM_MODE"
+local UTILITY_DEFAULTS_VERSION_FLAG = "ALT_FARM_UTILITY_DEFAULTS_VERSION"
 local ACTIVE_SCRIPT_FLAG = "ALT_FARM_ACTIVE_INSTANCE"
 
 -- Read the installer's global settings from the executor/chunk environment.
@@ -156,11 +158,40 @@ local TargetTeleporting = false -- Main continuously follows the locked target u
 local TargetEngaged = false
 local TargetLockedForSkill = nil
 local InVoidPhase = false
-local Mode = "Alt" -- "Main" or "Alt"; Alt is the default
 
--- Persisted by the launcher and restored by the teleport bootstrap.
-local KeepScriptEnabled = ExecutorEnvironment[KEEP_SCRIPT_FLAG] == true
-local AutoRejoinEnabled = ExecutorEnvironment[AUTO_REJOIN_FLAG] == true
+-- Persist Main/Alt mode across supported teleports. Alt is the default only
+-- when no valid mode has previously been stored.
+local persistedMode = ExecutorEnvironment[MODE_FLAG]
+local Mode = (persistedMode == "Main" or persistedMode == "Alt") and persistedMode or "Alt"
+pcall(function()
+    ExecutorEnvironment[MODE_FLAG] = Mode
+end)
+
+-- One-time migration: turn Keep Script and Auto Rejoin on when this version
+-- is first installed, even if an earlier version left stale false flags behind.
+-- After migration, explicit user toggles persist across executions/teleports.
+local UTILITY_DEFAULTS_VERSION = 1
+if ExecutorEnvironment[UTILITY_DEFAULTS_VERSION_FLAG] ~= UTILITY_DEFAULTS_VERSION then
+    pcall(function()
+        ExecutorEnvironment[KEEP_SCRIPT_FLAG] = true
+        ExecutorEnvironment[AUTO_REJOIN_FLAG] = true
+        ExecutorEnvironment[UTILITY_DEFAULTS_VERSION_FLAG] = UTILITY_DEFAULTS_VERSION
+    end)
+end
+
+local function GetOrInitializeUtilityFlag(flagName)
+    local value = ExecutorEnvironment[flagName]
+    if value == nil then
+        value = true
+        pcall(function()
+            ExecutorEnvironment[flagName] = true
+        end)
+    end
+    return value == true
+end
+
+local KeepScriptEnabled = GetOrInitializeUtilityFlag(KEEP_SCRIPT_FLAG)
+local AutoRejoinEnabled = GetOrInitializeUtilityFlag(AUTO_REJOIN_FLAG)
 local AutoRejoinConnections = {}
 local AutoRejoinWatchedTitles = setmetatable({}, { __mode = "k" })
 local AutoRejoinWatchedPromptGuis = setmetatable({}, { __mode = "k" })
@@ -692,6 +723,8 @@ local decodedConfig = HttpService:JSONDecode(%q)
 env[%q] = decodedConfig
 env[%q] = %s
 env[%q] = %s
+env[%q] = %q
+env[%q] = %s
 env["WEBHOOK_URL"] = decodedConfig.WEBHOOK_URL
 env["TargetNames"] = decodedConfig.TargetNames
 _G.WEBHOOK_URL = decodedConfig.WEBHOOK_URL
@@ -701,7 +734,8 @@ local chunk, loadError = loadstring(source)
 if not chunk then error(loadError) end
 chunk(decodedConfig)
 ]], configJson, FARM_CONFIG_KEY, KEEP_SCRIPT_FLAG, tostring(KeepScriptEnabled),
-       AUTO_REJOIN_FLAG, tostring(AutoRejoinEnabled), SCRIPT_RAW_URL)
+       AUTO_REJOIN_FLAG, tostring(AutoRejoinEnabled), MODE_FLAG, Mode,
+       UTILITY_DEFAULTS_VERSION_FLAG, tostring(UTILITY_DEFAULTS_VERSION), SCRIPT_RAW_URL)
 
     local ok, err = pcall(function()
         queueFunction(queueCode)
@@ -1719,6 +1753,9 @@ local function SetMode(newMode)
         return
     end
     Mode = newMode
+    pcall(function()
+        ExecutorEnvironment[MODE_FLAG] = newMode
+    end)
     TargetEngaged = false
     TargetLockedForSkill = nil
     TargetTeleporting = false
@@ -1765,6 +1802,9 @@ table.insert(Connections, AutoRejoinButton.Activated:Connect(function()
 end))
 UpdateModeButtons()
 UpdateUtilityButtons()
+if Mode == "Main" then
+    StartMainWebhookSchedule()
+end
 -- Start damage monitoring for the character already present when the script runs.
 if Player.Character then
     RefreshStagingPositionForCharacter(Player.Character)
