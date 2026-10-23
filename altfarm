@@ -35,8 +35,9 @@ local KEEP_SCRIPT_FLAG = "ALT_FARM_KEEP_SCRIPT_ENABLED"
 local AUTO_REJOIN_FLAG = "ALT_FARM_AUTO_REJOIN_ENABLED"
 local ACTIVE_SCRIPT_FLAG = "ALT_FARM_ACTIVE_INSTANCE"
 
--- Read personal configuration supplied by the standalone launcher. This hosted
--- file deliberately contains no webhook URL or target usernames.
+-- Read the installer's global settings from the executor/chunk environment.
+-- WEBHOOK_URL and TargetNames stay out of this hosted file; the tiny launcher
+-- declares them globally, and this startup block bridges them into shared state.
 local ExecutorEnvironment = _G
 pcall(function()
     if type(getgenv) == "function" then
@@ -47,22 +48,60 @@ pcall(function()
     end
 end)
 
-local InjectedFarmConfig = ExecutorEnvironment[FARM_CONFIG_KEY]
-if type(InjectedFarmConfig) ~= "table" then
-    -- The compact launcher exposes only these two globals before loadstring.
-    -- Accept them as configuration and normalize them for teleport persistence.
-    local globalWebhook = ExecutorEnvironment.WEBHOOK_URL or _G.WEBHOOK_URL
-    local globalTargets = ExecutorEnvironment.TargetNames or _G.TargetNames
+local ConfigEnvironments = {}
+local function AddConfigEnvironment(candidate)
+    if type(candidate) ~= "table" then
+        return
+    end
+    for _, current in ipairs(ConfigEnvironments) do
+        if current == candidate then
+            return
+        end
+    end
+    table.insert(ConfigEnvironments, candidate)
+end
+
+-- Some executors put global assignments in the current loadstring environment,
+-- while others expose them through getgenv() or _G. Check each safely.
+pcall(function()
+    if type(getfenv) == "function" then
+        AddConfigEnvironment(getfenv())
+        AddConfigEnvironment(getfenv(0))
+    end
+end)
+AddConfigEnvironment(ExecutorEnvironment)
+AddConfigEnvironment(_G)
+
+local InjectedFarmConfig = nil
+
+-- Prefer the current launcher's explicit globals over any cached config so that
+-- editing the two settings and rerunning the tiny launcher takes effect.
+for _, env in ipairs(ConfigEnvironments) do
+    local globalWebhook = rawget(env, "WEBHOOK_URL")
+    local globalTargets = rawget(env, "TargetNames")
     if type(globalWebhook) == "string" and type(globalTargets) == "table" then
         InjectedFarmConfig = {
             WEBHOOK_URL = globalWebhook,
             TargetNames = globalTargets,
         }
-        ExecutorEnvironment[FARM_CONFIG_KEY] = InjectedFarmConfig
-    else
-        warn("AltFarm config is missing. Set WEBHOOK_URL and TargetNames in the launcher first.")
-        return
+        break
     end
+end
+
+-- Queued teleports restore this config table before re-running the hosted file.
+if type(InjectedFarmConfig) ~= "table" then
+    for _, env in ipairs(ConfigEnvironments) do
+        local candidate = rawget(env, FARM_CONFIG_KEY)
+        if type(candidate) == "table" then
+            InjectedFarmConfig = candidate
+            break
+        end
+    end
+end
+
+if type(InjectedFarmConfig) ~= "table" then
+    warn("AltFarm config is missing. Set WEBHOOK_URL and TargetNames as globals in the launcher first.")
+    return
 end
 
 local WEBHOOK_URL = type(InjectedFarmConfig.WEBHOOK_URL) == "string"
@@ -76,9 +115,26 @@ if type(InjectedFarmConfig.TargetNames) == "table" then
     end
 end
 if #TargetNames == 0 then
-    warn("AltFarm config has no TargetNames. Add at least one username in AltFarmLauncher.lua.")
+    warn("AltFarm config has no TargetNames. Add at least one username in the launcher first.")
     return
 end
+
+-- Normalize and bridge the resolved values for this run and future teleport queues.
+InjectedFarmConfig = {
+    WEBHOOK_URL = WEBHOOK_URL,
+    TargetNames = table.clone(TargetNames),
+}
+for _, env in ipairs(ConfigEnvironments) do
+    pcall(function()
+        env[FARM_CONFIG_KEY] = InjectedFarmConfig
+        env.WEBHOOK_URL = WEBHOOK_URL
+        env.TargetNames = table.clone(TargetNames)
+    end)
+end
+pcall(function()
+    ExecutorEnvironment[FARM_CONFIG_KEY] = InjectedFarmConfig
+    _G[FARM_CONFIG_KEY] = InjectedFarmConfig
+end)
 
 -- Prevent the launcher and queued teleport bootstrap from starting duplicate copies.
 if ExecutorEnvironment[ACTIVE_SCRIPT_FLAG] == true then
