@@ -461,16 +461,19 @@ local AltAnimationTrack = nil
 local AltAnimationObject = nil
 local AltAnimationCharacter = nil
 local AltAnimationLengthWarned = false
--- Leaderstats and rank-promotion label
+-- Leaderstats and leaderboard/rank-promotion UI.
 local leaderstats = Player:WaitForChild("leaderstats")
 local TotalKillsStat = leaderstats:WaitForChild("Total Kills")
-local Goal = workspace
+-- Kills is the stat used to compare the account against leaderboard cutoffs.
+-- Total Kills is kept separate for its display and the next 5k milestone.
+local CurrentKillsStat = leaderstats:WaitForChild("Kills")
+local LeaderboardHolder = workspace
     :WaitForChild("Map")
     :WaitForChild("Total Kills Leaderboard")
     :WaitForChild("a")
     :WaitForChild("SurfaceGui")
     :WaitForChild("Holder")
-    :WaitForChild("Goal")
+local Goal = LeaderboardHolder:WaitForChild("Goal")
 -- Track how long each target character has been alive.
 local function TrackTargetCharacter(targetPlayer, character, isInitialCharacter)
     if not isInitialCharacter then
@@ -584,6 +587,16 @@ local SessionTimerLabel = MakeInfoLabel(
     UDim2.fromOffset(155, 231),
     UDim2.fromOffset(340, 30)
 )
+local MilestoneETALabel = MakeInfoLabel(
+    "MilestoneETALabel",
+    UDim2.fromOffset(155, 268),
+    UDim2.fromOffset(390, 30)
+)
+local LeaderboardETALabel = MakeInfoLabel(
+    "LeaderboardETALabel",
+    UDim2.fromOffset(155, 305),
+    UDim2.fromOffset(390, 30)
+)
 local function MakeModeButton(name, text, position, width)
     local button = Instance.new("TextButton")
     button.Name = name
@@ -600,10 +613,10 @@ local function MakeModeButton(name, text, position, width)
     corner.Parent = button
     return button
 end
-local AltButton = MakeModeButton("AltButton", "Alt", UDim2.fromOffset(155, 268))
-local MainButton = MakeModeButton("MainButton", "Main", UDim2.fromOffset(258, 268))
-local KeepScriptButton = MakeModeButton("KeepScriptButton", "Keep: OFF", UDim2.fromOffset(155, 305), 120)
-local AutoRejoinButton = MakeModeButton("AutoRejoinButton", "Rejoin: OFF", UDim2.fromOffset(282, 305), 135)
+local AltButton = MakeModeButton("AltButton", "Alt", UDim2.fromOffset(155, 342))
+local MainButton = MakeModeButton("MainButton", "Main", UDim2.fromOffset(258, 342))
+local KeepScriptButton = MakeModeButton("KeepScriptButton", "Keep: OFF", UDim2.fromOffset(155, 379), 120)
+local AutoRejoinButton = MakeModeButton("AutoRejoinButton", "Rejoin: OFF", UDim2.fromOffset(282, 379), 135)
 KeepScriptButton.TextSize = 13
 AutoRejoinButton.TextSize = 13
 local function UpdateModeButtons()
@@ -1076,28 +1089,30 @@ local function MonitorAltDamage(character)
     end)
 end
 -- Read comma-formatted or plain numbers embedded in the rank-promotion RichText label.
+local RankPromotionKillsNeeded = nil
 local function UpdateKillsNeeded()
     local text = Goal.Text or ""
     local numberText = text:match("<font[^>]*>([%d,]+)</font>")
         or text:match("([%d,]+)%s+[Mm][Oo][Rr][Ee]%s+[Kk][Ii][Ll][Ll][Ss]")
-    if numberText then
-        -- Convert values such as "1,500" into 1500 for reliable numeric formatting.
-        local numericValue = tonumber((numberText:gsub(",", "")))
-        if numericValue then
-            local digits = tostring(math.floor(numericValue))
-            local formatted = digits:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
-            KillsNeededLabel.Text = "Kills needed for rank: " .. formatted
-        else
-            KillsNeededLabel.Text = "Kills needed for rank: unavailable"
-        end
+    local numericValue = numberText and tonumber((numberText:gsub(",", ""))) or nil
+
+    if numericValue then
+        RankPromotionKillsNeeded = math.max(0, math.floor(numericValue))
+        local digits = tostring(RankPromotionKillsNeeded)
+        local formatted = digits:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
+        KillsNeededLabel.Text = "Kills needed for rank: " .. formatted
     else
-        KillsNeededLabel.Text = "Kills needed for rank: unavailable"
+        RankPromotionKillsNeeded = nil
+        KillsNeededLabel.Text = "Kills needed for rank: 0, max rank"
     end
 end
--- Count kills earned after this script starts; keep the session count cumulative if the game stat resets.
+
+-- Count kills gained after startup from Total Kills; use that rate for both ETAs.
 local sessionStartTime = os.clock()
 local lastObservedTotal = tonumber(TotalKillsStat.Value) or 0
 local sessionKills = 0
+local UpdateETAs
+
 local function UpdateSessionTimer()
     if not Running then
         return
@@ -1115,6 +1130,7 @@ local function UpdateSessionTimer()
         seconds
     )
 end
+
 local function UpdateSessionKillsAndRate()
     if not Running then
         return
@@ -1136,14 +1152,143 @@ local function UpdateSessionKillsAndRate()
         killsPerHour
     )
     UpdateSessionTimer()
+    if UpdateETAs then
+        UpdateETAs()
+    end
 end
+
+local function FormatWebhookNumber(value)
+    local number = math.floor(tonumber(value) or 0)
+    local text = tostring(math.abs(number))
+    local reversed = text:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
+    return (number < 0 and "-" or "") .. reversed
+end
+
+-- ETA durations are rounded up to the next whole minute, so a positive remainder
+-- never appears to be complete early. Example: 3d 9h 30m.
+local function FormatETA(killsNeeded, killsPerHour)
+    killsNeeded = math.max(0, tonumber(killsNeeded) or 0)
+    killsPerHour = tonumber(killsPerHour) or 0
+    if killsNeeded <= 0 then
+        return "0d 0h 0m"
+    end
+    if killsPerHour <= 0 then
+        return "Calculating..."
+    end
+    local totalMinutes = math.ceil((killsNeeded / killsPerHour) * 60)
+    local days = math.floor(totalMinutes / 1440)
+    local hours = math.floor((totalMinutes % 1440) / 60)
+    local minutes = totalMinutes % 60
+    return string.format("%dd %dh %dm", days, hours, minutes)
+end
+
+local function GetLeaderboardKillValues()
+    local values = {}
+    for _, object in ipairs(LeaderboardHolder:GetDescendants()) do
+        if object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox") then
+            local text = tostring(object.Text or ""):gsub("<[^>]+>", " ")
+            local numberText = text:match("([%d,]+)%s+[Kk][Ii][Ll][Ll][Ss]")
+            if numberText then
+                local value = tonumber((numberText:gsub(",", "")))
+                if value then
+                    table.insert(values, value)
+                end
+            end
+        end
+    end
+    table.sort(values, function(a, b)
+        return a > b
+    end)
+    return values
+end
+
+-- Determine the next rank target from the current Kills stat (not Total Kills).
+-- If we're at or above the #15 cutoff, move on to #14, then #13, and so on.
+local function GetNextLeaderboardTarget(currentKills)
+    local values = GetLeaderboardKillValues()
+    if #values < 15 then
+        return nil, nil, nil, "Waiting for leaderboard"
+    end
+
+    local targetRank = 15
+    for rank = 15, 1, -1 do
+        if currentKills >= values[rank] then
+            targetRank = rank - 1
+        else
+            targetRank = rank
+            break
+        end
+    end
+
+    if targetRank <= 0 then
+        return 1, values[1], 0, "Reached"
+    end
+
+    local cutoff = values[targetRank]
+    local killsNeeded = math.max(0, cutoff + 1 - currentKills)
+    return targetRank, cutoff, killsNeeded, nil
+end
+
+local nextLeaderboardRank = nil
+local nextLeaderboardKillsNeeded = nil
+local nextLeaderboardETA = "Calculating..."
+local nextMilestone = nil
+local nextMilestoneKillsNeeded = nil
+local nextMilestoneETA = "Calculating..."
+
+UpdateETAs = function()
+    if not Running then
+        return
+    end
+
+    local elapsed = math.max(os.clock() - sessionStartTime, 1)
+    local killsPerHour = sessionKills * 3600 / elapsed
+    local totalKills = tonumber(TotalKillsStat.Value) or 0
+    local currentKills = tonumber(CurrentKillsStat.Value) or 0
+
+    nextMilestone = (math.floor(math.max(0, totalKills) / 5000) + 1) * 5000
+    nextMilestoneKillsNeeded = math.max(0, nextMilestone - totalKills)
+    nextMilestoneETA = FormatETA(nextMilestoneKillsNeeded, killsPerHour)
+    MilestoneETALabel.Text = "ETA to " .. FormatWebhookNumber(nextMilestone)
+        .. " total kills: " .. nextMilestoneETA
+
+    local targetRank, cutoff, killsNeeded, status = GetNextLeaderboardTarget(currentKills)
+    nextLeaderboardRank = targetRank
+    nextLeaderboardKillsNeeded = killsNeeded
+
+    if status == "Reached" then
+        nextLeaderboardETA = "Reached"
+        LeaderboardETALabel.Text = "ETA to Top 1: Reached"
+    elseif status == "Waiting for leaderboard" then
+        nextLeaderboardETA = "Calculating..."
+        LeaderboardETALabel.Text = "ETA to Top 15: Waiting for leaderboard"
+    elseif targetRank and cutoff then
+        nextLeaderboardETA = FormatETA(killsNeeded, killsPerHour)
+        LeaderboardETALabel.Text = "ETA to Top " .. tostring(targetRank) .. ": " .. nextLeaderboardETA
+    else
+        nextLeaderboardETA = "Calculating..."
+        LeaderboardETALabel.Text = "ETA to leaderboard: Calculating..."
+    end
+end
+
 UpdateKillsNeeded()
 UpdateSessionKillsAndRate()
 UpdateSessionTimer()
-table.insert(Connections, Goal:GetPropertyChangedSignal("Text"):Connect(UpdateKillsNeeded))
+UpdateETAs()
+table.insert(Connections, Goal:GetPropertyChangedSignal("Text"):Connect(function()
+    UpdateKillsNeeded()
+    UpdateETAs()
+end))
 table.insert(Connections, TotalKillsStat:GetPropertyChangedSignal("Value"):Connect(UpdateSessionKillsAndRate))
--- Main-mode webhook reporting. Each entry into Main sends immediately, then every 30 minutes.
-local webhookScheduleGeneration = 0
+table.insert(Connections, CurrentKillsStat:GetPropertyChangedSignal("Value"):Connect(UpdateETAs))
+-- Keep leaderboard ETAs current even when leaderboard UI entries change independently of local stats.
+task.spawn(function()
+    while Running do
+        UpdateETAs()
+        task.wait(5)
+    end
+end)
+
 local function GetWebhookSessionTime()
     local elapsedSeconds = math.max(0, math.floor(os.clock() - sessionStartTime))
     local days = math.floor(elapsedSeconds / 86400)
@@ -1152,63 +1297,163 @@ local function GetWebhookSessionTime()
     local seconds = elapsedSeconds % 60
     return string.format("%dd %02dh %02dm %02ds", days, hours, minutes, seconds)
 end
+
 local function GetKillsNeededForWebhook()
-    local value = KillsNeededLabel.Text:match("^Kills needed for rank:%s*(.+)$")
-    if not value or value == "unavailable" then
-        return "Unavailable"
+    if RankPromotionKillsNeeded == nil then
+        return nil
     end
-    return value
+    return FormatWebhookNumber(RankPromotionKillsNeeded)
 end
-local function FormatWebhookNumber(value)
-    local number = math.floor(tonumber(value) or 0)
-    local text = tostring(math.abs(number))
-    local reversed = text:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
-    return (number < 0 and "-" or "") .. reversed
+
+local function GetPlayerTotalKills(player)
+    local stats = player:FindFirstChild("leaderstats")
+    if not stats then
+        return nil
+    end
+    local stat = stats:FindFirstChild("Total Kills")
+    if not stat then
+        stat = stats:FindFirstChild("Kills")
+    end
+    return stat and tonumber(stat.Value) or nil
 end
+
+local function BuildOtherPlayersFields()
+    local excluded = {[string.lower(Player.Name)] = true}
+    for _, targetName in ipairs(TargetNames) do
+        if type(targetName) == "string" and targetName ~= "" then
+            excluded[string.lower(targetName)] = true
+        end
+    end
+
+    local playerLines = {}
+    for _, otherPlayer in ipairs(Players:GetPlayers()) do
+        if not excluded[string.lower(otherPlayer.Name)] then
+            local totalKills = GetPlayerTotalKills(otherPlayer)
+            local killsText = totalKills and FormatWebhookNumber(totalKills) or "N/A"
+            table.insert(playerLines, string.format("• %s — %s total kills", otherPlayer.Name, killsText))
+        end
+    end
+    table.sort(playerLines, function(a, b)
+        return string.lower(a) < string.lower(b)
+    end)
+
+    local fields = {}
+    if #playerLines == 0 then
+        table.insert(fields, {
+            name = "👥  Other players in server",
+            value = "No eligible players in the server.",
+            inline = false,
+        })
+        return fields
+    end
+
+    -- Discord limits each field value to 1024 characters. Split the list without
+    -- dropping anyone, using as many fields as the embed field limit permits.
+    local chunk = ""
+    local part = 1
+    for _, line in ipairs(playerLines) do
+        local append = (chunk == "" and line or "\n" .. line)
+        if #chunk + #append > 1000 then
+            table.insert(fields, {
+                name = part == 1 and "👥  Other players in server" or ("Other players (continued " .. part .. ")"),
+                value = chunk,
+                inline = false,
+            })
+            part += 1
+            chunk = line
+        else
+            chunk ..= append
+        end
+    end
+    if chunk ~= "" then
+        table.insert(fields, {
+            name = part == 1 and "👥  Other players in server" or ("Other players (continued " .. part .. ")"),
+            value = chunk,
+            inline = false,
+        })
+    end
+    return fields
+end
+
 local function SendMainWebhookUpdate()
     if not Running or Mode ~= "Main" then
         return
     end
+
+    -- Refresh the target calculation before constructing the report.
+    UpdateETAs()
     local elapsed = math.max(os.clock() - sessionStartTime, 1)
     local killsPerHour = sessionKills * 3600 / elapsed
+    local totalKills = tonumber(TotalKillsStat.Value) or 0
+    local currentKills = tonumber(CurrentKillsStat.Value) or 0
     local rankValue = GetKillsNeededForWebhook()
-    if rankValue ~= "Unavailable" then
-        -- Keep the already-formatted leaderboard value (e.g. "1,500").
-        rankValue = rankValue:gsub("^%s+", ""):gsub("%s+$", "")
+
+    local fields = {
+        {
+            name = "👤  User",
+            value = tostring(Player.DisplayName),
+            inline = true,
+        },
+        {
+            name = "📊  Total Kills",
+            value = "**" .. FormatWebhookNumber(totalKills) .. "**",
+            inline = true,
+        },
+        {
+            name = "⚔️  Current Kills",
+            value = "**" .. FormatWebhookNumber(currentKills) .. "**",
+            inline = true,
+        },
+        {
+            name = "💀  Session kills gained",
+            value = "**" .. FormatWebhookNumber(sessionKills) .. "**",
+            inline = true,
+        },
+        {
+            name = "⏱️  Session time",
+            value = "`" .. GetWebhookSessionTime() .. "`",
+            inline = true,
+        },
+        {
+            name = "⚡  Average kills per hour",
+            value = "**" .. FormatWebhookNumber(killsPerHour) .. "**",
+            inline = true,
+        },
+        {
+            name = "🎯  ETA to next 5k mark (" .. FormatWebhookNumber(nextMilestone or 0) .. ")",
+            value = "`" .. tostring(nextMilestoneETA) .. "`",
+            inline = true,
+        },
+        {
+            name = "🏆  ETA to Top " .. tostring(nextLeaderboardRank or 15),
+            value = "`" .. tostring(nextLeaderboardETA) .. "`",
+            inline = true,
+        },
+    }
+
+    -- Only include the promotion-rank field when its value was actually available.
+    if rankValue ~= nil then
+        table.insert(fields, 4, {
+            name = "🏅  Kills needed for rank",
+            value = "**" .. rankValue .. "**",
+            inline = true,
+        })
     end
+
+    for _, playerField in ipairs(BuildOtherPlayersFields()) do
+        if #fields >= 25 then
+            warn("Webhook player list clipped by Discord's 25-field embed limit.")
+            break
+        end
+        table.insert(fields, playerField)
+    end
+
     local payload = {
         username = "Farm Monitor",
         embeds = {{
-            title = "Farming Session Report",
-            description = "A quick snapshot of your current progress.",
+            title = "Alt Farm update",
             color = 0x8B5CF6,
-            fields = {
-                {
-                    name = "👤  User",
-                    value = tostring(Player.DisplayName),
-                    inline = true,
-                },
-                {
-                    name = "🏆  Kills needed for rank",
-                    value = "**" .. rankValue .. "**",
-                    inline = true,
-                },
-                {
-                    name = "💀  Session kills gained",
-                    value = "**" .. FormatWebhookNumber(sessionKills) .. "**",
-                    inline = true,
-                },
-                {
-                    name = "⏱️  Session time",
-                    value = "`" .. GetWebhookSessionTime() .. "`",
-                    inline = true,
-                },
-                {
-                    name = "⚡  Average kills per hour",
-                    value = "**" .. FormatWebhookNumber(killsPerHour) .. "**",
-                    inline = true,
-                },
-            },
+            fields = fields,
             timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
         }},
     }
