@@ -1,3 +1,5 @@
+local LauncherConfig = ...
+
 -- Wait for Roblox to finish loading before initializing this script.
 pcall(function()
     if type(getgenv) == "function" then
@@ -72,19 +74,22 @@ end)
 AddConfigEnvironment(ExecutorEnvironment)
 AddConfigEnvironment(_G)
 
-local InjectedFarmConfig = nil
+-- The launcher passes a config table as the loaded chunk's first argument.
+-- This avoids relying on separate loadstring chunks sharing the same globals.
+local InjectedFarmConfig = type(LauncherConfig) == "table" and LauncherConfig or nil
 
--- Prefer the current launcher's explicit globals over any cached config so that
--- editing the two settings and rerunning the tiny launcher takes effect.
-for _, env in ipairs(ConfigEnvironments) do
-    local globalWebhook = rawget(env, "WEBHOOK_URL")
-    local globalTargets = rawget(env, "TargetNames")
-    if type(globalWebhook) == "string" and type(globalTargets) == "table" then
-        InjectedFarmConfig = {
-            WEBHOOK_URL = globalWebhook,
-            TargetNames = globalTargets,
-        }
-        break
+-- Backward-compatible fallback for launchers that still set global variables.
+if type(InjectedFarmConfig) ~= "table" then
+    for _, env in ipairs(ConfigEnvironments) do
+        local globalWebhook = rawget(env, "WEBHOOK_URL")
+        local globalTargets = rawget(env, "TargetNames")
+        if type(globalWebhook) == "string" and type(globalTargets) == "table" then
+            InjectedFarmConfig = {
+                WEBHOOK_URL = globalWebhook,
+                TargetNames = globalTargets,
+            }
+            break
+        end
     end
 end
 
@@ -694,7 +699,7 @@ _G.TargetNames = decodedConfig.TargetNames
 local source = game:HttpGet(%q)
 local chunk, loadError = loadstring(source)
 if not chunk then error(loadError) end
-chunk()
+chunk(decodedConfig)
 ]], configJson, FARM_CONFIG_KEY, KEEP_SCRIPT_FLAG, tostring(KeepScriptEnabled),
        AUTO_REJOIN_FLAG, tostring(AutoRejoinEnabled), SCRIPT_RAW_URL)
 
