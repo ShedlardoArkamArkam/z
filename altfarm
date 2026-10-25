@@ -32,7 +32,7 @@ local PlayerGui = Player:WaitForChild("PlayerGui")
 
 -- Raw host URL used for queued teleport reloads. Bump this query value when publishing
 -- a new hosted revision so cached raw responses don't keep an older script running.
-local SCRIPT_RAW_URL = "https://raw.githubusercontent.com/ShedlardoArkamArkam/z/refs/heads/main/altfarm?altfarm_version=20261023c"
+local SCRIPT_RAW_URL = "https://raw.githubusercontent.com/ShedlardoArkamArkam/z/refs/heads/main/altfarm?altfarm_version=20261025b"
 local FARM_CONFIG_KEY = "ALT_FARM_CONFIG"
 local KEEP_SCRIPT_FLAG = "ALT_FARM_KEEP_SCRIPT_ENABLED"
 local AUTO_REJOIN_FLAG = "ALT_FARM_AUTO_REJOIN_ENABLED"
@@ -171,7 +171,7 @@ end)
 -- One-time migration for this repair: restore Keep Script and Auto Rejoin to ON
 -- even if the previous broken Stop left stale OFF flags in the executor environment.
 -- After this migration, explicit user toggles persist across supported teleports.
-local UTILITY_DEFAULTS_VERSION = 2
+local UTILITY_DEFAULTS_VERSION = 3
 if ExecutorEnvironment[UTILITY_DEFAULTS_VERSION_FLAG] ~= UTILITY_DEFAULTS_VERSION then
     pcall(function()
         ExecutorEnvironment[KEEP_SCRIPT_FLAG] = true
@@ -202,7 +202,13 @@ local AutoRejoinFallbackUsed = false
 local AutoRejoinPrimarySameServer = false
 local AutoRejoinTeleportStarted = false
 local AutoRejoinAttemptGeneration = 0
+local AutoRejoinAttemptCount = 0
+local AutoRejoinRetryScheduled = false
+local AutoRejoinAlwaysPublic = false
 local PersistenceTeleportConnection = nil
+
+local AUTO_REJOIN_DELAY_SECONDS = 10
+local AUTO_REJOIN_REQUEST_TIMEOUT_SECONDS = 10
 
 -- If the compact launcher is executed again, detect changed global settings and
 -- apply them live without starting a duplicate copy of the main script.
@@ -280,7 +286,7 @@ local ANTI_AFK_ENABLED = true
 -- Alt-only damage reset. Set the boolean false to disable it, or change
 -- the delay in seconds (0 means reset immediately when damage is detected).
 local ALT_RESET_ON_DAMAGE = true
-local ALT_DAMAGE_RESET_DELAY = 0.4
+local ALT_DAMAGE_RESET_DELAY = 0.7
 -- Alt-only failsafe: reset once after this character life exceeds the limit.
 -- Each CharacterAdded starts a fresh timer; this never runs in Main mode.
 local ALT_ALIVE_FAILSAFE_ENABLED = true
@@ -295,10 +301,19 @@ local TARGET_TELEPORT_BLOCK_Y = -500
 local TARGET_TELEPORT_DEEP_VOID_OVERRIDE_Y = -550 -- Below this Y, allow target teleporting again as requested.
 -- Zero means attempt the staging teleport once per Heartbeat frame.
 local STAGING_INTERVAL = 0
--- STAGE SELECTION: set exactly one option to true and the other to false.
-local USE_SMALL_BASEPLATE_STAGE = false -- Stage 1: (-75, 84, 20352)
-local USE_VOID_STAGE = true             -- Default stage: Void platform center (-200, -300, 10000)
-local SMALL_BASEPLATE_POSITION = Vector3.new(-75, 84, 20352)
+-- Runtime stage selection. The selected stage persists through supported teleports.
+local STAGE_FLAG = "ALT_FARM_STAGE"
+local persistedStage = ExecutorEnvironment[STAGE_FLAG]
+local CurrentStage = persistedStage == "Baseplate" and "Baseplate" or "Void"
+pcall(function()
+    ExecutorEnvironment[STAGE_FLAG] = CurrentStage
+end)
+
+-- The existing in-game baseplate is bounded by these two opposite corners.
+-- Randomize within its X/Z bounds and place the root a few studs above its Y level.
+local BASEPLATE_CORNER_A = Vector3.new(364, 1855, 25627)
+local BASEPLATE_CORNER_B = Vector3.new(-158, 1855, 25134)
+local BASEPLATE_EDGE_MARGIN = 6
 local VOID_STAGE_POSITION = Vector3.new(-200, -300, 10000)
 local VOID_PLATFORM_SIZE = Vector3.new(1000, 5, 1000)
 local VOID_PLATFORM_TRANSPARENCY = 0.5
@@ -354,6 +369,16 @@ local function MakeRandomVoidPosition()
     local y = VOID_STAGE_POSITION.Y + VOID_PLATFORM_SIZE.Y / 2 + 3
     return Vector3.new(x, y, z)
 end
+local function MakeRandomBaseplatePosition()
+    local minX = math.min(BASEPLATE_CORNER_A.X, BASEPLATE_CORNER_B.X) + BASEPLATE_EDGE_MARGIN
+    local maxX = math.max(BASEPLATE_CORNER_A.X, BASEPLATE_CORNER_B.X) - BASEPLATE_EDGE_MARGIN
+    local minZ = math.min(BASEPLATE_CORNER_A.Z, BASEPLATE_CORNER_B.Z) + BASEPLATE_EDGE_MARGIN
+    local maxZ = math.max(BASEPLATE_CORNER_A.Z, BASEPLATE_CORNER_B.Z) - BASEPLATE_EDGE_MARGIN
+    local x = StagingRandom:NextNumber(minX, maxX)
+    local z = StagingRandom:NextNumber(minZ, maxZ)
+    local y = math.max(BASEPLATE_CORNER_A.Y, BASEPLATE_CORNER_B.Y) + 3
+    return Vector3.new(x, y, z)
+end
 local function ChooseSafeVoidPosition()
     local playerRoots = GetOtherLivingPlayerRoots()
     local bestPosition = nil
@@ -394,10 +419,10 @@ local function RefreshStagingPositionForCharacter(character)
         return nil
     end
     StagingPositionCharacter = character
-    if USE_VOID_STAGE then
+    if CurrentStage == "Void" then
         CurrentStagingPosition = ChooseSafeVoidPosition()
     else
-        CurrentStagingPosition = SMALL_BASEPLATE_POSITION
+        CurrentStagingPosition = MakeRandomBaseplatePosition()
     end
     return CurrentStagingPosition
 end
@@ -407,39 +432,39 @@ local function GetStagingPositionForCharacter(character)
     end
     return CurrentStagingPosition
 end
--- Remove the previous Sky-stage platform name if an older script left it behind.
+
+-- Remove the old sky-stage part name if an older script left one behind.
 local legacySkyPlatform = workspace:FindFirstChild("AutomationSkyStagePlatform")
 if legacySkyPlatform then
     legacySkyPlatform:Destroy()
 end
-if USE_SMALL_BASEPLATE_STAGE == USE_VOID_STAGE then
-    warn("Choose exactly one stage: USE_SMALL_BASEPLATE_STAGE or USE_VOID_STAGE. Defaulting to the small baseplate.")
-    USE_SMALL_BASEPLATE_STAGE = true
-    USE_VOID_STAGE = false
-end
--- Create/update the Void platform only when Void stage is selected.
--- This is a client-side part because this code runs in a LocalScript.
-local existingVoidPlatform = workspace:FindFirstChild(VOID_PLATFORM_NAME)
-if USE_VOID_STAGE then
-    if existingVoidPlatform and not existingVoidPlatform:IsA("BasePart") then
+
+-- The Void platform is only needed while Void is selected. Baseplate mode uses
+-- the existing in-game baseplate and never creates a replacement for it.
+local function UpdateVoidPlatformForStage()
+    local existingVoidPlatform = workspace:FindFirstChild(VOID_PLATFORM_NAME)
+    if CurrentStage == "Void" then
+        if existingVoidPlatform and not existingVoidPlatform:IsA("BasePart") then
+            existingVoidPlatform:Destroy()
+            existingVoidPlatform = nil
+        end
+        local voidPlatform = existingVoidPlatform or Instance.new("Part")
+        voidPlatform.Name = VOID_PLATFORM_NAME
+        voidPlatform.Anchored = true
+        voidPlatform.CanCollide = true
+        voidPlatform.CanTouch = false
+        voidPlatform.Size = VOID_PLATFORM_SIZE
+        voidPlatform.CFrame = CFrame.new(VOID_STAGE_POSITION)
+        voidPlatform.Transparency = VOID_PLATFORM_TRANSPARENCY
+        voidPlatform.Material = Enum.Material.SmoothPlastic
+        voidPlatform.Color = Color3.fromRGB(145, 190, 255)
+        voidPlatform.CastShadow = false
+        voidPlatform.Parent = workspace
+    elseif existingVoidPlatform then
         existingVoidPlatform:Destroy()
-        existingVoidPlatform = nil
     end
-    local voidPlatform = existingVoidPlatform or Instance.new("Part")
-    voidPlatform.Name = VOID_PLATFORM_NAME
-    voidPlatform.Anchored = true
-    voidPlatform.CanCollide = true
-    voidPlatform.CanTouch = false
-    voidPlatform.Size = VOID_PLATFORM_SIZE
-    voidPlatform.CFrame = CFrame.new(VOID_STAGE_POSITION)
-    voidPlatform.Transparency = VOID_PLATFORM_TRANSPARENCY
-    voidPlatform.Material = Enum.Material.SmoothPlastic
-    voidPlatform.Color = Color3.fromRGB(145, 190, 255)
-    voidPlatform.CastShadow = false
-    voidPlatform.Parent = workspace
-elseif existingVoidPlatform then
-    existingVoidPlatform:Destroy()
 end
+UpdateVoidPlatformForStage()
 local SpawnTimes = {}
 local AliveSince = {}
 local TrackedTargets = {}
@@ -468,9 +493,12 @@ local TotalKillsStat = leaderstats:WaitForChild("Total Kills")
 -- Kills is the stat used to compare the account against leaderboard cutoffs.
 -- Total Kills is kept separate for its display and the next 5k milestone.
 local CurrentKillsStat = leaderstats:WaitForChild("Kills")
-local LeaderboardHolder = workspace
+-- The game now stores the authoritative Top 15 data as JSON on the leaderboard Model.
+-- Keep the UI Holder for the game's separate title/rank-goal label.
+local LeaderboardModel = workspace
     :WaitForChild("Map")
     :WaitForChild("Total Kills Leaderboard")
+local LeaderboardHolder = LeaderboardModel
     :WaitForChild("a")
     :WaitForChild("SurfaceGui")
     :WaitForChild("Holder")
@@ -618,8 +646,18 @@ local AltButton = MakeModeButton("AltButton", "Alt", UDim2.fromOffset(155, 342))
 local MainButton = MakeModeButton("MainButton", "Main", UDim2.fromOffset(258, 342))
 local KeepScriptButton = MakeModeButton("KeepScriptButton", "Keep: OFF", UDim2.fromOffset(155, 379), 120)
 local AutoRejoinButton = MakeModeButton("AutoRejoinButton", "Rejoin: OFF", UDim2.fromOffset(282, 379), 135)
+local VoidStageButton = MakeModeButton("VoidStageButton", "Void", UDim2.fromOffset(25, 173), 120)
+local BaseplateStageButton = MakeModeButton("BaseplateStageButton", "Baseplate", UDim2.fromOffset(25, 209), 120)
 KeepScriptButton.TextSize = 13
 AutoRejoinButton.TextSize = 13
+local function UpdateStageButtons()
+    VoidStageButton.BackgroundColor3 = CurrentStage == "Void"
+        and Color3.fromRGB(55, 145, 90)
+        or Color3.fromRGB(65, 65, 65)
+    BaseplateStageButton.BackgroundColor3 = CurrentStage == "Baseplate"
+        and Color3.fromRGB(55, 145, 90)
+        or Color3.fromRGB(65, 65, 65)
+end
 local function UpdateModeButtons()
     AltButton.BackgroundColor3 = Mode == "Alt"
         and Color3.fromRGB(55, 145, 90)
@@ -763,6 +801,95 @@ end
 
 local AttemptAutoRejoin
 local FallbackToPublicServer
+local StartAutoRejoinAttempt
+
+-- Send standalone status notices, independent of the selected farming mode.
+local function SendAutoRejoinWebhookNotice(status, details, attemptNumber)
+    if type(WEBHOOK_URL) ~= "string" or WEBHOOK_URL == "" then
+        return
+    end
+
+    local requestFunction = nil
+    if type(request) == "function" then
+        requestFunction = request
+    elseif type(http_request) == "function" then
+        requestFunction = http_request
+    else
+        pcall(function()
+            if type(syn) == "table" and type(syn.request) == "function" then
+                requestFunction = syn.request
+            end
+        end)
+    end
+    if type(requestFunction) ~= "function" then
+        warn("Auto Rejoin webhook not sent: no supported HTTP request function.")
+        return
+    end
+
+    local payload = {
+        username = "Farm Monitor",
+        embeds = {{
+            title = "Alt Farm update",
+            description = "**Auto Rejoin: " .. tostring(status) .. "**\n" .. tostring(details or ""),
+            color = status == "Kick detected" and 0xDC2626 or 0x8B5CF6,
+            fields = {
+                {
+                    name = "👤 User",
+                    value = tostring(Player.DisplayName) .. " (`" .. tostring(Player.Name) .. "`)",
+                    inline = true,
+                },
+                {
+                    name = "Mode",
+                    value = tostring(Mode),
+                    inline = true,
+                },
+                {
+                    name = "Attempt",
+                    value = tostring(attemptNumber or 0),
+                    inline = true,
+                },
+            },
+            timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        }},
+    }
+
+    local okEncode, body = pcall(function()
+        return HttpService:JSONEncode(payload)
+    end)
+    if not okEncode then
+        warn("Auto Rejoin webhook not sent: failed to encode payload: " .. tostring(body))
+        return
+    end
+
+    task.spawn(function()
+        local okRequest, response = pcall(function()
+            return requestFunction({
+                Url = WEBHOOK_URL,
+                Method = "POST",
+                Headers = { ["Content-Type"] = "application/json" },
+                Body = body,
+            })
+        end)
+        if not okRequest then
+            warn("Auto Rejoin webhook request failed: " .. tostring(response))
+            return
+        end
+        local statusCode = response and (response.StatusCode or response.Status)
+        if statusCode and tonumber(statusCode) and tonumber(statusCode) >= 400 then
+            warn("Auto Rejoin webhook returned HTTP status " .. tostring(statusCode))
+        end
+    end)
+end
+
+local function ForcePersistenceOnForRejoin()
+    -- A kick/reconnect must always carry both utility toggles into the new session.
+    KeepScriptEnabled = true
+    AutoRejoinEnabled = true
+    StoreExecutorFlag(KEEP_SCRIPT_FLAG, true)
+    StoreExecutorFlag(AUTO_REJOIN_FLAG, true)
+    StoreExecutorFlag(UTILITY_DEFAULTS_VERSION_FLAG, UTILITY_DEFAULTS_VERSION)
+    UpdateUtilityButtons()
+end
 
 local function DisconnectAutoRejoinMonitor()
     for _, connection in ipairs(AutoRejoinConnections) do
@@ -776,39 +903,114 @@ local function DisconnectAutoRejoinMonitor()
     AutoRejoinMonitorActive = false
 end
 
-FallbackToPublicServer = function(attemptGeneration)
+local function ScheduleAutoRejoinRetry(attemptGeneration, reason, usePublicOnNextAttempt)
     if not Running or not AutoRejoinEnabled or not AutoRejoinInProgress
         or attemptGeneration ~= AutoRejoinAttemptGeneration then
         return
     end
-    if AutoRejoinFallbackUsed then
-        AutoRejoinInProgress = false
+
+    if usePublicOnNextAttempt then
+        AutoRejoinAlwaysPublic = true
+        AutoRejoinFallbackUsed = true
+    end
+    if AutoRejoinRetryScheduled then
         return
     end
 
-    AutoRejoinFallbackUsed = true
-    AutoRejoinPrimarySameServer = false
-    task.delay(0.5, function()
+    AutoRejoinRetryScheduled = true
+    AutoRejoinTeleportStarted = false
+    -- Player.OnTeleport may have cleared this marker while a failed teleport was
+    -- being initialized. Restore it while this copy is still running.
+    StoreExecutorFlag(ACTIVE_SCRIPT_FLAG, true)
+    warn("Auto Rejoin failed (" .. tostring(reason or "unknown reason")
+        .. "); retrying in " .. tostring(AUTO_REJOIN_DELAY_SECONDS) .. " seconds.")
+
+    task.delay(AUTO_REJOIN_DELAY_SECONDS, function()
         if not Running or not AutoRejoinEnabled or not AutoRejoinInProgress
             or attemptGeneration ~= AutoRejoinAttemptGeneration then
+            AutoRejoinRetryScheduled = false
             return
         end
-        local ok, err = pcall(function()
-            TeleportService:Teleport(game.PlaceId, Player)
-        end)
-        if not ok then
-            warn("Auto Rejoin fallback failed: " .. tostring(err))
-            AutoRejoinInProgress = false
+
+        AutoRejoinRetryScheduled = false
+        StartAutoRejoinAttempt(attemptGeneration)
+    end)
+end
+
+StartAutoRejoinAttempt = function(attemptGeneration)
+    if not Running or not AutoRejoinEnabled or not AutoRejoinInProgress
+        or attemptGeneration ~= AutoRejoinAttemptGeneration then
+        return
+    end
+
+    AutoRejoinAttemptCount += 1
+    local thisAttemptNumber = AutoRejoinAttemptCount
+    AutoRejoinTeleportStarted = false
+
+    local useSameServer = not AutoRejoinAlwaysPublic
+        and #Players:GetPlayers() > 1
+        and game.JobId ~= ""
+
+    -- Once using a public-server attempt, keep subsequent retries public too.
+    if not useSameServer then
+        AutoRejoinAlwaysPublic = true
+    end
+
+    AutoRejoinPrimarySameServer = useSameServer
+    AutoRejoinFallbackUsed = not useSameServer
+    SendAutoRejoinWebhookNotice(
+        "Rejoining",
+        "Starting reconnect attempt " .. tostring(AutoRejoinAttemptCount) .. ".",
+        AutoRejoinAttemptCount
+    )
+
+    local ok, err = pcall(function()
+        if useSameServer then
+            TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, Player)
         else
-            task.delay(12, function()
-                if Running and AutoRejoinEnabled and AutoRejoinInProgress
-                    and attemptGeneration == AutoRejoinAttemptGeneration
-                    and not AutoRejoinTeleportStarted then
-                    AutoRejoinInProgress = false
-                end
-            end)
+            TeleportService:Teleport(game.PlaceId, Player)
         end
     end)
+
+    if not ok then
+        ScheduleAutoRejoinRetry(
+            attemptGeneration,
+            "teleport request error: " .. tostring(err),
+            useSameServer
+        )
+        return
+    end
+
+    -- If teleport did not begin, treat this attempt as failed. If it did begin
+    -- but no replacement AltFarm instance appeared, retry instead of hanging.
+    task.delay(AUTO_REJOIN_REQUEST_TIMEOUT_SECONDS, function()
+        if not Running or not AutoRejoinEnabled or not AutoRejoinInProgress
+            or attemptGeneration ~= AutoRejoinAttemptGeneration
+            or AutoRejoinAttemptCount ~= thisAttemptNumber
+            or AutoRejoinRetryScheduled then
+            return
+        end
+
+        if AutoRejoinTeleportStarted and ExecutorEnvironment[ACTIVE_SCRIPT_FLAG] == true then
+            -- The queued script has started in the replacement session.
+            return
+        end
+
+        ScheduleAutoRejoinRetry(
+            attemptGeneration,
+            "no replacement session detected within "
+                .. tostring(AUTO_REJOIN_REQUEST_TIMEOUT_SECONDS) .. " seconds",
+            useSameServer
+        )
+    end)
+end
+
+FallbackToPublicServer = function(attemptGeneration)
+    ScheduleAutoRejoinRetry(
+        attemptGeneration,
+        "same-server reconnect failed",
+        true
+    )
 end
 
 AttemptAutoRejoin = function()
@@ -818,48 +1020,31 @@ AttemptAutoRejoin = function()
 
     AutoRejoinInProgress = true
     AutoRejoinFallbackUsed = false
+    AutoRejoinPrimarySameServer = false
     AutoRejoinTeleportStarted = false
+    AutoRejoinRetryScheduled = false
+    AutoRejoinAlwaysPublic = false
+    AutoRejoinAttemptCount = 0
     AutoRejoinAttemptGeneration += 1
     local attemptGeneration = AutoRejoinAttemptGeneration
-    local useSameServer = #Players:GetPlayers() > 1 and game.JobId ~= ""
-    AutoRejoinPrimarySameServer = useSameServer
 
-    task.spawn(function()
-        if not Running or not AutoRejoinEnabled
+    ForcePersistenceOnForRejoin()
+    SendAutoRejoinWebhookNotice(
+        "Kick detected",
+        "Roblox's disconnected prompt was detected. The first reconnect attempt will start in "
+            .. tostring(AUTO_REJOIN_DELAY_SECONDS) .. " seconds.",
+        0
+    )
+    print("AltFarm: kick detected; auto-rejoin starts in "
+        .. tostring(AUTO_REJOIN_DELAY_SECONDS) .. " seconds.")
+
+    -- Give a temporary internet outage time to recover before the first request.
+    task.delay(AUTO_REJOIN_DELAY_SECONDS, function()
+        if not Running or not AutoRejoinEnabled or not AutoRejoinInProgress
             or attemptGeneration ~= AutoRejoinAttemptGeneration then
-            AutoRejoinInProgress = false
             return
         end
-
-        local ok, err = pcall(function()
-            if useSameServer then
-                TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, Player)
-            else
-                TeleportService:Teleport(game.PlaceId, Player)
-            end
-        end)
-        if not ok then
-            warn("Auto Rejoin request failed: " .. tostring(err))
-            if useSameServer then
-                FallbackToPublicServer(attemptGeneration)
-            else
-                AutoRejoinInProgress = false
-            end
-            return
-        end
-
-        task.delay(12, function()
-            if not Running or not AutoRejoinEnabled or not AutoRejoinInProgress
-                or attemptGeneration ~= AutoRejoinAttemptGeneration
-                or AutoRejoinTeleportStarted then
-                return
-            end
-            if useSameServer then
-                FallbackToPublicServer(attemptGeneration)
-            else
-                AutoRejoinInProgress = false
-            end
-        end)
+        StartAutoRejoinAttempt(attemptGeneration)
     end)
 end
 
@@ -925,16 +1110,17 @@ local function EnableAutoRejoin()
                 AttachRobloxPromptGui(child)
             end
         end
-        table.insert(AutoRejoinConnections, TeleportService.TeleportInitFailed:Connect(function(failedPlayer)
+        table.insert(AutoRejoinConnections, TeleportService.TeleportInitFailed:Connect(function(failedPlayer, teleportResult, errorMessage)
             if failedPlayer ~= Player or not Running or not AutoRejoinEnabled
                 or not AutoRejoinInProgress then
                 return
             end
-            if AutoRejoinPrimarySameServer and not AutoRejoinFallbackUsed then
-                FallbackToPublicServer(AutoRejoinAttemptGeneration)
-            elseif not AutoRejoinFallbackUsed then
-                AutoRejoinInProgress = false
-            end
+            AutoRejoinTeleportStarted = false
+            ScheduleAutoRejoinRetry(
+                AutoRejoinAttemptGeneration,
+                "TeleportInitFailed: " .. tostring(errorMessage or teleportResult or "unknown error"),
+                AutoRejoinPrimarySameServer
+            )
         end))
     end
 
@@ -945,6 +1131,7 @@ local function DisableAutoRejoin()
     AutoRejoinEnabled = false
     StoreExecutorFlag(AUTO_REJOIN_FLAG, false)
     AutoRejoinInProgress = false
+    AutoRejoinRetryScheduled = false
     AutoRejoinAttemptGeneration += 1
     DisconnectAutoRejoinMonitor()
     UpdateUtilityButtons()
@@ -962,11 +1149,12 @@ PersistenceTeleportConnection = Player.OnTeleport:Connect(function(teleportState
             ExecutorEnvironment[ACTIVE_SCRIPT_FLAG] = nil
         end)
     elseif teleportState == Enum.TeleportState.Failed and AutoRejoinInProgress then
-        if AutoRejoinPrimarySameServer and not AutoRejoinFallbackUsed then
-            FallbackToPublicServer(AutoRejoinAttemptGeneration)
-        elseif not AutoRejoinFallbackUsed then
-            AutoRejoinInProgress = false
-        end
+        AutoRejoinTeleportStarted = false
+        ScheduleAutoRejoinRetry(
+            AutoRejoinAttemptGeneration,
+            "Player.OnTeleport reported Failed",
+            AutoRejoinPrimarySameServer
+        )
     end
 end)
 
@@ -1184,22 +1372,38 @@ local function FormatETA(killsNeeded, killsPerHour)
 end
 
 local function GetLeaderboardKillValues()
+    -- Updated game model: Workspace.Map["Total Kills Leaderboard"].Top
+    -- is a JSON array whose entries use { u = userId, k = kills, n = username }.
+    -- Read the k field directly instead of scraping RichText UI labels.
     local values = {}
-    for _, object in ipairs(LeaderboardHolder:GetDescendants()) do
-        if object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox") then
-            local text = tostring(object.Text or ""):gsub("<[^>]+>", " ")
-            local numberText = text:match("([%d,]+)%s+[Kk][Ii][Ll][Ll][Ss]")
-            if numberText then
-                local value = tonumber((numberText:gsub(",", "")))
-                if value then
-                    table.insert(values, value)
-                end
+    local encodedTop = LeaderboardModel:GetAttribute("Top")
+
+    if type(encodedTop) ~= "string" or encodedTop == "" then
+        return values
+    end
+
+    local decodeOK, entries = pcall(function()
+        return HttpService:JSONDecode(encodedTop)
+    end)
+
+    if not decodeOK or type(entries) ~= "table" then
+        return values
+    end
+
+    for _, entry in ipairs(entries) do
+        if type(entry) == "table" then
+            local kills = tonumber(entry.k)
+            if kills and kills >= 0 then
+                table.insert(values, math.floor(kills))
             end
         end
     end
+
+    -- Normalize order rather than depending on the attribute array's order.
     table.sort(values, function(a, b)
         return a > b
     end)
+
     return values
 end
 
@@ -1277,7 +1481,9 @@ table.insert(Connections, Goal:GetPropertyChangedSignal("Text"):Connect(function
 end))
 table.insert(Connections, TotalKillsStat:GetPropertyChangedSignal("Value"):Connect(UpdateSessionKillsAndRate))
 table.insert(Connections, CurrentKillsStat:GetPropertyChangedSignal("Value"):Connect(UpdateETAs))
--- Keep leaderboard ETAs current even when leaderboard UI entries change independently of local stats.
+-- Recalculate immediately when the game refreshes the authoritative Top JSON attribute.
+table.insert(Connections, LeaderboardModel:GetAttributeChangedSignal("Top"):Connect(UpdateETAs))
+-- Also poll as a lightweight fallback in case the game refreshes related data separately.
 task.spawn(function()
     while Running do
         UpdateETAs()
@@ -1699,7 +1905,7 @@ local function TeleportLocalToStaging()
     end
     -- Preserve the existing dynamic re-check behavior for Main mode only.
     -- Alt mode intentionally keeps its first safe position for the whole life.
-    if USE_VOID_STAGE and Mode == "Main" then
+    if CurrentStage == "Void" and Mode == "Main" then
         local otherRoots = GetOtherLivingPlayerRoots()
         if not IsSafeVoidPosition(
             stagingPosition,
@@ -1996,6 +2202,35 @@ RunService:BindToRenderStep(
         end
     end
 )
+local function SetStage(newStage)
+    if not Running or (newStage ~= "Void" and newStage ~= "Baseplate") then
+        return
+    end
+    if CurrentStage == newStage then
+        return
+    end
+
+    CurrentStage = newStage
+    StoreExecutorFlag(STAGE_FLAG, CurrentStage)
+    StagingPositionCharacter = nil
+    CurrentStagingPosition = nil
+    AltStageTeleportedCharacter = nil
+
+    UpdateVoidPlatformForStage()
+    UpdateStageButtons()
+
+    -- Alt is always staged, so move it immediately. In Main, avoid interrupting
+    -- an active target/skill cycle; the staging loop applies the new choice once idle.
+    if Mode == "Alt" then
+        TeleportLocalToStaging()
+    elseif not TargetEngaged
+        and not TargetTeleporting
+        and not InVoidPhase
+        and not GetOldestAliveTarget() then
+        TeleportLocalToStaging()
+    end
+end
+
 local function SetMode(newMode)
     if not Running or (newMode ~= "Main" and newMode ~= "Alt") then
         return
@@ -2027,11 +2262,17 @@ local function SetMode(newMode)
         TeleportLocalToStaging()
     end
 end
- table.insert(Connections, AltButton.Activated:Connect(function()
+table.insert(Connections, AltButton.Activated:Connect(function()
     SetMode("Alt")
 end))
 table.insert(Connections, MainButton.Activated:Connect(function()
     SetMode("Main")
+end))
+table.insert(Connections, VoidStageButton.Activated:Connect(function()
+    SetStage("Void")
+end))
+table.insert(Connections, BaseplateStageButton.Activated:Connect(function()
+    SetStage("Baseplate")
 end))
 table.insert(Connections, KeepScriptButton.Activated:Connect(function()
     KeepScriptEnabled = not KeepScriptEnabled
@@ -2054,6 +2295,7 @@ table.insert(Connections, AutoRejoinButton.Activated:Connect(function()
 end))
 UpdateModeButtons()
 UpdateUtilityButtons()
+UpdateStageButtons()
 if Mode == "Main" then
     StartMainWebhookSchedule()
 end
