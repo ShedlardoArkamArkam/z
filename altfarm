@@ -286,7 +286,7 @@ local ANTI_AFK_ENABLED = true
 -- Alt-only damage reset. Set the boolean false to disable it, or change
 -- the delay in seconds (0 means reset immediately when damage is detected).
 local ALT_RESET_ON_DAMAGE = true
-local ALT_DAMAGE_RESET_DELAY = 0.7
+local ALT_DAMAGE_RESET_DELAY = 0.2
 -- Alt-only failsafe: reset once after this character life exceeds the limit.
 -- Each CharacterAdded starts a fresh timer; this never runs in Main mode.
 local ALT_ALIVE_FAILSAFE_ENABLED = true
