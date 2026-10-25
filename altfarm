@@ -32,7 +32,7 @@ local PlayerGui = Player:WaitForChild("PlayerGui")
 
 -- Raw host URL used for queued teleport reloads. Bump this query value when publishing
 -- a new hosted revision so cached raw responses don't keep an older script running.
-local SCRIPT_RAW_URL = "https://raw.githubusercontent.com/ShedlardoArkamArkam/z/refs/heads/main/altfarm?altfarm_version=20261025b"
+local SCRIPT_RAW_URL = "https://raw.githubusercontent.com/ShedlardoArkamArkam/z/refs/heads/main/altfarm?altfarm_version=20261025c"
 local FARM_CONFIG_KEY = "ALT_FARM_CONFIG"
 local KEEP_SCRIPT_FLAG = "ALT_FARM_KEEP_SCRIPT_ENABLED"
 local AUTO_REJOIN_FLAG = "ALT_FARM_AUTO_REJOIN_ENABLED"
@@ -804,7 +804,7 @@ local FallbackToPublicServer
 local StartAutoRejoinAttempt
 
 -- Send standalone status notices, independent of the selected farming mode.
-local function SendAutoRejoinWebhookNotice(status, details, attemptNumber)
+local function SendAutoRejoinWebhookNotice(status, details, attemptNumber, pingEveryone)
     if type(WEBHOOK_URL) ~= "string" or WEBHOOK_URL == "" then
         return
     end
@@ -828,6 +828,12 @@ local function SendAutoRejoinWebhookNotice(status, details, attemptNumber)
 
     local payload = {
         username = "Farm Monitor",
+        -- Discord only reliably processes @everyone mentions from message content,
+        -- and the allowed_mentions field explicitly permits the notification.
+        content = pingEveryone and "@everyone" or nil,
+        allowed_mentions = {
+            parse = pingEveryone and {"everyone"} or {},
+        },
         embeds = {{
             title = "Alt Farm update",
             description = "**Auto Rejoin: " .. tostring(status) .. "**\n" .. tostring(details or ""),
@@ -919,6 +925,13 @@ local function ScheduleAutoRejoinRetry(attemptGeneration, reason, usePublicOnNex
 
     AutoRejoinRetryScheduled = true
     AutoRejoinTeleportStarted = false
+    SendAutoRejoinWebhookNotice(
+        "Reconnect failed",
+        "Reconnect attempt failed: " .. tostring(reason or "unknown reason")
+            .. ". Retrying in " .. tostring(AUTO_REJOIN_DELAY_SECONDS) .. " seconds.",
+        AutoRejoinAttemptCount,
+        true
+    )
     -- Player.OnTeleport may have cleared this marker while a failed teleport was
     -- being initialized. Restore it while this copy is still running.
     StoreExecutorFlag(ACTIVE_SCRIPT_FLAG, true)
@@ -961,7 +974,8 @@ StartAutoRejoinAttempt = function(attemptGeneration)
     SendAutoRejoinWebhookNotice(
         "Rejoining",
         "Starting reconnect attempt " .. tostring(AutoRejoinAttemptCount) .. ".",
-        AutoRejoinAttemptCount
+        AutoRejoinAttemptCount,
+        true
     )
 
     local ok, err = pcall(function()
@@ -1033,7 +1047,8 @@ AttemptAutoRejoin = function()
         "Kick detected",
         "Roblox's disconnected prompt was detected. The first reconnect attempt will start in "
             .. tostring(AUTO_REJOIN_DELAY_SECONDS) .. " seconds.",
-        0
+        0,
+        true
     )
     print("AltFarm: kick detected; auto-rejoin starts in "
         .. tostring(AUTO_REJOIN_DELAY_SECONDS) .. " seconds.")
