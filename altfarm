@@ -2533,14 +2533,14 @@ local function RunMainCycle()
     if not TeleportThenTapKey(Enum.KeyCode.Two) then
         return false
     end
-    if not WaitForMain(2.05) then
+    if not WaitForMain(2.085) then
         return false
     end
     -- Wait for a target to have been alive >= TARGET_ALIVE_SECONDS seconds, teleport behind them, wait 0.2s, press 1.
     if not TeleportThenTapKey(Enum.KeyCode.One) then
         return false
     end
-    if not WaitForMain(2.35) then
+    if not WaitForMain(2.4) then
         return false
     end
     -- Pause target teleporting before entering the void.
