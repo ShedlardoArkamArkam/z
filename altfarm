@@ -2540,7 +2540,7 @@ local function RunMainCycle()
     if not TeleportThenTapKey(Enum.KeyCode.One) then
         return false
     end
-    if not WaitForMain(2.4) then
+    if not WaitForMain(2.6) then
         return false
     end
     -- Pause target teleporting before entering the void.
