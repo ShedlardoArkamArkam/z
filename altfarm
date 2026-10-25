@@ -1997,7 +1997,7 @@ local function TeleportThenTapKey(keyCode)
             TargetTeleporting = true
             TargetEngaged = true
             if TeleportBehindTarget(chosen) then
-                if not WaitForMain(0.2) then
+                if not WaitForMain(0.1) then
                     TargetTeleporting = false
                     TargetLockedForSkill = nil
                     return false
@@ -2533,14 +2533,14 @@ local function RunMainCycle()
     if not TeleportThenTapKey(Enum.KeyCode.Two) then
         return false
     end
-    if not WaitForMain(2) then
+    if not WaitForMain(2.05) then
         return false
     end
     -- Wait for a target to have been alive >= TARGET_ALIVE_SECONDS seconds, teleport behind them, wait 0.2s, press 1.
     if not TeleportThenTapKey(Enum.KeyCode.One) then
         return false
     end
-    if not WaitForMain(2.3) then
+    if not WaitForMain(2.35) then
         return false
     end
     -- Pause target teleporting before entering the void.
