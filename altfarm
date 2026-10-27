@@ -32,7 +32,7 @@ local PlayerGui = Player:WaitForChild("PlayerGui")
 
 -- Raw host URL used for queued teleport reloads. Bump this query value when publishing
 -- a new hosted revision so cached raw responses don't keep an older script running.
-local SCRIPT_RAW_URL = "https://raw.githubusercontent.com/ShedlardoArkamArkam/z/refs/heads/main/altfarm?altfarm_version=20261025c"
+local SCRIPT_RAW_URL = "https://raw.githubusercontent.com/ShedlardoArkamArkam/z/refs/heads/main/altfarm?altfarm_version=20261027c"
 local FARM_CONFIG_KEY = "ALT_FARM_CONFIG"
 local KEEP_SCRIPT_FLAG = "ALT_FARM_KEEP_SCRIPT_ENABLED"
 local AUTO_REJOIN_FLAG = "ALT_FARM_AUTO_REJOIN_ENABLED"
@@ -40,9 +40,9 @@ local MODE_FLAG = "ALT_FARM_MODE"
 local UTILITY_DEFAULTS_VERSION_FLAG = "ALT_FARM_UTILITY_DEFAULTS_VERSION"
 local ACTIVE_SCRIPT_FLAG = "ALT_FARM_ACTIVE_INSTANCE"
 
--- Read the installer's global settings from the executor/chunk environment.
--- WEBHOOK_URL and TargetNames stay out of this hosted file; the tiny launcher
--- declares them globally, and this startup block bridges them into shared state.
+-- Read the loader's settings from the chunk argument first, with globals as a
+-- backward-compatible fallback. The hosted source does not contain the webhook
+-- or target usernames; configurable safety options are passed in the same table.
 local ExecutorEnvironment = _G
 pcall(function()
     if type(getgenv) == "function" then
@@ -90,6 +90,10 @@ if type(InjectedFarmConfig) ~= "table" then
             InjectedFarmConfig = {
                 WEBHOOK_URL = globalWebhook,
                 TargetNames = globalTargets,
+                BLACKLISTED_USER_IDS = rawget(env, "BLACKLISTED_USER_IDS"),
+                BLACKLISTED_GROUP_ID = rawget(env, "BLACKLISTED_GROUP_ID"),
+                BLACKLISTED_GROUP_ROLE_KEYWORDS = rawget(env, "BLACKLISTED_GROUP_ROLE_KEYWORDS"),
+                KILL_PAUSE_THRESHOLD = rawget(env, "KILL_PAUSE_THRESHOLD"),
             }
             break
         end
@@ -112,6 +116,68 @@ if type(InjectedFarmConfig) ~= "table" then
     return
 end
 
+-- Default safety settings are also used when an older launcher omits one of
+-- the new fields. The loader can override each list/value independently.
+local DEFAULT_BLACKLISTED_USER_IDS = {
+    422755031, 198131804, 681405668, 3414432341, 339633571,
+    430966809, 2039323684, 117723419, 1015595932, 263944298,
+    112905203, 2284964418, 1266437961, 3120648134, 1148139861,
+    1633233654, 3350014406, 971193650, 661273560, 66105529,
+    77342385, 167343092, 2055306963, 141984224, 438917845,
+    1391134999, 1796550069, 255671730, 3162123826, 1059541187,
+    1259898795, 31070091, 1041867508, 994994173, 1446694201,
+    77525605, 1001242712, 2533866869, 4983064295,
+}
+local DEFAULT_BLACKLISTED_GROUP_ID = 12013007
+local DEFAULT_BLACKLISTED_GROUP_ROLE_KEYWORDS = {
+    "rank1", "rank2", "rank3", "rank4", "rank5", "rank6",
+}
+local DEFAULT_KILL_PAUSE_THRESHOLD = 25000
+
+local function NormalizeUserIdList(value)
+    local source = type(value) == "table" and value or DEFAULT_BLACKLISTED_USER_IDS
+    local result, seen = {}, {}
+    for _, candidate in ipairs(source) do
+        local userId = tonumber(candidate)
+        if userId and userId > 0 and userId == math.floor(userId) and not seen[userId] then
+            seen[userId] = true
+            table.insert(result, userId)
+        end
+    end
+    return result
+end
+
+local function NormalizeRoleKeywords(value)
+    local source = type(value) == "table" and value or DEFAULT_BLACKLISTED_GROUP_ROLE_KEYWORDS
+    local result, seen = {}, {}
+    for _, candidate in ipairs(source) do
+        if type(candidate) == "string" then
+            local keyword = candidate:lower():gsub("%s+", "")
+            if keyword ~= "" and not seen[keyword] then
+                seen[keyword] = true
+                table.insert(result, keyword)
+            end
+        end
+    end
+    return result
+end
+
+local function NormalizeGroupId(value)
+    local groupId = tonumber(value)
+    if groupId and groupId > 0 and groupId == math.floor(groupId) then
+        return groupId
+    end
+    return DEFAULT_BLACKLISTED_GROUP_ID
+end
+
+local function NormalizeKillThreshold(value)
+    local threshold = tonumber(value)
+    if threshold and threshold == threshold and threshold ~= math.huge and threshold >= 0 then
+        return math.floor(threshold)
+    end
+    return DEFAULT_KILL_PAUSE_THRESHOLD
+end
+
 local WEBHOOK_URL = type(InjectedFarmConfig.WEBHOOK_URL) == "string"
     and InjectedFarmConfig.WEBHOOK_URL or ""
 local TargetNames = {}
@@ -127,16 +193,50 @@ if #TargetNames == 0 then
     return
 end
 
--- Normalize and bridge the resolved values for this run and future teleport queues.
+local BLACKLISTED_USER_IDS = NormalizeUserIdList(InjectedFarmConfig.BLACKLISTED_USER_IDS)
+local BLACKLISTED_GROUP_ID = NormalizeGroupId(InjectedFarmConfig.BLACKLISTED_GROUP_ID)
+local BLACKLISTED_GROUP_ROLE_KEYWORDS = NormalizeRoleKeywords(InjectedFarmConfig.BLACKLISTED_GROUP_ROLE_KEYWORDS)
+local KILL_PAUSE_THRESHOLD = NormalizeKillThreshold(
+    InjectedFarmConfig.KILL_PAUSE_THRESHOLD or InjectedFarmConfig.HIGH_KILL_PAUSE_THRESHOLD
+)
+local BLACKLISTED_USER_ID_LOOKUP = {}
+local function RebuildBlacklistedUserIdLookup()
+    table.clear(BLACKLISTED_USER_ID_LOOKUP)
+    for _, userId in ipairs(BLACKLISTED_USER_IDS) do
+        BLACKLISTED_USER_ID_LOOKUP[userId] = true
+    end
+end
+RebuildBlacklistedUserIdLookup()
+
+local function ApplySafetyConfig(config)
+    config = type(config) == "table" and config or {}
+    BLACKLISTED_USER_IDS = NormalizeUserIdList(config.BLACKLISTED_USER_IDS)
+    BLACKLISTED_GROUP_ID = NormalizeGroupId(config.BLACKLISTED_GROUP_ID)
+    BLACKLISTED_GROUP_ROLE_KEYWORDS = NormalizeRoleKeywords(config.BLACKLISTED_GROUP_ROLE_KEYWORDS)
+    KILL_PAUSE_THRESHOLD = NormalizeKillThreshold(
+        config.KILL_PAUSE_THRESHOLD or config.HIGH_KILL_PAUSE_THRESHOLD
+    )
+    RebuildBlacklistedUserIdLookup()
+end
+
+-- Normalize and bridge the complete configuration for this run and future teleports.
 InjectedFarmConfig = {
     WEBHOOK_URL = WEBHOOK_URL,
     TargetNames = table.clone(TargetNames),
+    BLACKLISTED_USER_IDS = table.clone(BLACKLISTED_USER_IDS),
+    BLACKLISTED_GROUP_ID = BLACKLISTED_GROUP_ID,
+    BLACKLISTED_GROUP_ROLE_KEYWORDS = table.clone(BLACKLISTED_GROUP_ROLE_KEYWORDS),
+    KILL_PAUSE_THRESHOLD = KILL_PAUSE_THRESHOLD,
 }
 for _, env in ipairs(ConfigEnvironments) do
     pcall(function()
         env[FARM_CONFIG_KEY] = InjectedFarmConfig
         env.WEBHOOK_URL = WEBHOOK_URL
         env.TargetNames = table.clone(TargetNames)
+        env.BLACKLISTED_USER_IDS = table.clone(BLACKLISTED_USER_IDS)
+        env.BLACKLISTED_GROUP_ID = BLACKLISTED_GROUP_ID
+        env.BLACKLISTED_GROUP_ROLE_KEYWORDS = table.clone(BLACKLISTED_GROUP_ROLE_KEYWORDS)
+        env.KILL_PAUSE_THRESHOLD = KILL_PAUSE_THRESHOLD
     end)
 end
 pcall(function()
@@ -159,6 +259,15 @@ local TargetTeleporting = false -- Main continuously follows the locked target u
 local TargetEngaged = false
 local TargetLockedForSkill = nil
 local InVoidPhase = false
+
+-- Safety guards. While SafetyPaused is true, automation/reset/teleport loops stop;
+-- the safety monitor and anti-AFK handler remain active.
+local SafetyPaused = false
+local SafetyPauseReason = nil
+local SafetyPauseApplyingStage = false
+local SafetyPauseAnchoredRoot = nil
+local SafetyPauseRootWasAnchored = nil
+local SafetyTerminating = false
 
 -- Persist Main/Alt mode across supported teleports. Alt is the default only
 -- when no valid mode has previously been stored.
@@ -241,9 +350,25 @@ task.spawn(function()
         -- Prefer whichever global environment actually changed compared with
         -- the values currently in use. The compact launcher needs no extra code.
         if GlobalsDiffer(envWebhook, envTargets) then
-            candidate = { WEBHOOK_URL = envWebhook, TargetNames = envTargets }
+            local saved = type(candidate) == "table" and candidate or {}
+            candidate = {
+                WEBHOOK_URL = envWebhook,
+                TargetNames = envTargets,
+                BLACKLISTED_USER_IDS = saved.BLACKLISTED_USER_IDS or ExecutorEnvironment.BLACKLISTED_USER_IDS,
+                BLACKLISTED_GROUP_ID = saved.BLACKLISTED_GROUP_ID or ExecutorEnvironment.BLACKLISTED_GROUP_ID,
+                BLACKLISTED_GROUP_ROLE_KEYWORDS = saved.BLACKLISTED_GROUP_ROLE_KEYWORDS or ExecutorEnvironment.BLACKLISTED_GROUP_ROLE_KEYWORDS,
+                KILL_PAUSE_THRESHOLD = saved.KILL_PAUSE_THRESHOLD or ExecutorEnvironment.KILL_PAUSE_THRESHOLD,
+            }
         elseif GlobalsDiffer(plainWebhook, plainTargets) then
-            candidate = { WEBHOOK_URL = plainWebhook, TargetNames = plainTargets }
+            local saved = type(candidate) == "table" and candidate or {}
+            candidate = {
+                WEBHOOK_URL = plainWebhook,
+                TargetNames = plainTargets,
+                BLACKLISTED_USER_IDS = saved.BLACKLISTED_USER_IDS or _G.BLACKLISTED_USER_IDS,
+                BLACKLISTED_GROUP_ID = saved.BLACKLISTED_GROUP_ID or _G.BLACKLISTED_GROUP_ID,
+                BLACKLISTED_GROUP_ROLE_KEYWORDS = saved.BLACKLISTED_GROUP_ROLE_KEYWORDS or _G.BLACKLISTED_GROUP_ROLE_KEYWORDS,
+                KILL_PAUSE_THRESHOLD = saved.KILL_PAUSE_THRESHOLD or _G.KILL_PAUSE_THRESHOLD,
+            }
         end
 
         if type(candidate) == "table" and candidate ~= InjectedFarmConfig then
@@ -261,18 +386,35 @@ task.spawn(function()
                 for _, targetName in ipairs(newNames) do
                     table.insert(TargetNames, targetName)
                 end
+                ApplySafetyConfig(candidate)
                 InjectedFarmConfig = {
                     WEBHOOK_URL = WEBHOOK_URL,
                     TargetNames = table.clone(TargetNames),
+                    BLACKLISTED_USER_IDS = table.clone(BLACKLISTED_USER_IDS),
+                    BLACKLISTED_GROUP_ID = BLACKLISTED_GROUP_ID,
+                    BLACKLISTED_GROUP_ROLE_KEYWORDS = table.clone(BLACKLISTED_GROUP_ROLE_KEYWORDS),
+                    KILL_PAUSE_THRESHOLD = KILL_PAUSE_THRESHOLD,
                 }
-                ExecutorEnvironment[FARM_CONFIG_KEY] = InjectedFarmConfig
+                for _, configEnv in ipairs(ConfigEnvironments) do
+                    pcall(function()
+                        configEnv[FARM_CONFIG_KEY] = InjectedFarmConfig
+                        configEnv.WEBHOOK_URL = WEBHOOK_URL
+                        configEnv.TargetNames = table.clone(TargetNames)
+                        configEnv.BLACKLISTED_USER_IDS = table.clone(BLACKLISTED_USER_IDS)
+                        configEnv.BLACKLISTED_GROUP_ID = BLACKLISTED_GROUP_ID
+                        configEnv.BLACKLISTED_GROUP_ROLE_KEYWORDS = table.clone(BLACKLISTED_GROUP_ROLE_KEYWORDS)
+                        configEnv.KILL_PAUSE_THRESHOLD = KILL_PAUSE_THRESHOLD
+                    end)
+                end
                 pcall(function()
+                    ExecutorEnvironment[FARM_CONFIG_KEY] = InjectedFarmConfig
                     ExecutorEnvironment.WEBHOOK_URL = WEBHOOK_URL
                     ExecutorEnvironment.TargetNames = table.clone(TargetNames)
+                    _G[FARM_CONFIG_KEY] = InjectedFarmConfig
                     _G.WEBHOOK_URL = WEBHOOK_URL
                     _G.TargetNames = table.clone(TargetNames)
                 end)
-                print("AltFarm: applied updated launcher configuration.")
+                print("AltFarm: applied updated launcher and safety configuration.")
             else
                 warn("AltFarm ignored an invalid launcher configuration update.")
             end
@@ -283,6 +425,11 @@ end)
 
 -- Best-effort anti-AFK. This may depend on executor support for virtual input.
 local ANTI_AFK_ENABLED = true
+
+-- Safety configuration is injected by the loader above and normalized once.
+-- Re-running the loader updates these values live; queued teleports serialize them.
+local GROUP_ROLE_RECHECK_SECONDS = 1
+local SAFETY_PLAYER_CHECK_INTERVAL = 1
 -- Alt-only damage reset. Set the boolean false to disable it, or change
 -- the delay in seconds (0 means reset immediately when damage is detected).
 local ALT_RESET_ON_DAMAGE = true
@@ -732,12 +879,16 @@ local function QueueCurrentScriptForTeleport()
         return
     end
 
-    -- Serialize the live config so webhook and target choices survive teleport,
-    -- even though those values are intentionally absent from the hosted source.
+    -- Serialize every user-configurable option so both Auto Rejoin and Keep Script
+    -- retain the blacklisted IDs, role keywords, group ID, and kill threshold too.
     local okConfig, configJson = pcall(function()
         return HttpService:JSONEncode({
             WEBHOOK_URL = WEBHOOK_URL,
             TargetNames = TargetNames,
+            BLACKLISTED_USER_IDS = BLACKLISTED_USER_IDS,
+            BLACKLISTED_GROUP_ID = BLACKLISTED_GROUP_ID,
+            BLACKLISTED_GROUP_ROLE_KEYWORDS = BLACKLISTED_GROUP_ROLE_KEYWORDS,
+            KILL_PAUSE_THRESHOLD = KILL_PAUSE_THRESHOLD,
         })
     end)
     if not okConfig then
@@ -779,8 +930,16 @@ env[%q] = %q
 env[%q] = %s
 env["WEBHOOK_URL"] = decodedConfig.WEBHOOK_URL
 env["TargetNames"] = decodedConfig.TargetNames
+env["BLACKLISTED_USER_IDS"] = decodedConfig.BLACKLISTED_USER_IDS
+env["BLACKLISTED_GROUP_ID"] = decodedConfig.BLACKLISTED_GROUP_ID
+env["BLACKLISTED_GROUP_ROLE_KEYWORDS"] = decodedConfig.BLACKLISTED_GROUP_ROLE_KEYWORDS
+env["KILL_PAUSE_THRESHOLD"] = decodedConfig.KILL_PAUSE_THRESHOLD
 _G.WEBHOOK_URL = decodedConfig.WEBHOOK_URL
 _G.TargetNames = decodedConfig.TargetNames
+_G.BLACKLISTED_USER_IDS = decodedConfig.BLACKLISTED_USER_IDS
+_G.BLACKLISTED_GROUP_ID = decodedConfig.BLACKLISTED_GROUP_ID
+_G.BLACKLISTED_GROUP_ROLE_KEYWORDS = decodedConfig.BLACKLISTED_GROUP_ROLE_KEYWORDS
+_G.KILL_PAUSE_THRESHOLD = decodedConfig.KILL_PAUSE_THRESHOLD
 local source = game:HttpGet(%q)
 local chunk, loadError = loadstring(source)
 if not chunk then error(loadError) end
@@ -883,6 +1042,77 @@ local function SendAutoRejoinWebhookNotice(status, details, attemptNumber, pingE
         local statusCode = response and (response.StatusCode or response.Status)
         if statusCode and tonumber(statusCode) and tonumber(statusCode) >= 400 then
             warn("Auto Rejoin webhook returned HTTP status " .. tostring(statusCode))
+        end
+    end)
+end
+
+-- General safety events use a top-level @everyone mention, separate from the
+-- Auto Rejoin status embeds, while preserving the configured webhook URL.
+local function SendSafetyWebhookNotice(message, details)
+    if type(WEBHOOK_URL) ~= "string" or WEBHOOK_URL == "" then
+        warn("Safety webhook skipped: WEBHOOK_URL is empty.")
+        return
+    end
+
+    local requestFunction = nil
+    if type(request) == "function" then
+        requestFunction = request
+    elseif type(http_request) == "function" then
+        requestFunction = http_request
+    else
+        pcall(function()
+            if type(syn) == "table" and type(syn.request) == "function" then
+                requestFunction = syn.request
+            end
+        end)
+    end
+    if type(requestFunction) ~= "function" then
+        warn("Safety webhook failed: no supported HTTP request function.")
+        return
+    end
+
+    local payload = {
+        username = "Farm Monitor",
+        content = "@everyone",
+        allowed_mentions = { parse = {"everyone"} },
+        embeds = {{
+            title = "Alt Farm safety alert",
+            description = "**" .. tostring(message) .. "**"
+                .. (details and ("\n" .. tostring(details)) or ""),
+            color = tostring(message):lower():find("blacklist", 1, true)
+                and 0xDC2626 or 0xF59E0B,
+            fields = {
+                { name = "User", value = tostring(Player.Name), inline = true },
+                { name = "Mode", value = tostring(Mode), inline = true },
+            },
+            timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        }},
+    }
+
+    local okEncode, body = pcall(function()
+        return HttpService:JSONEncode(payload)
+    end)
+    if not okEncode then
+        warn("Safety webhook failed to encode: " .. tostring(body))
+        return
+    end
+
+    task.spawn(function()
+        local okRequest, response = pcall(function()
+            return requestFunction({
+                Url = WEBHOOK_URL,
+                Method = "POST",
+                Headers = { ["Content-Type"] = "application/json" },
+                Body = body,
+            })
+        end)
+        if not okRequest then
+            warn("Safety webhook request failed: " .. tostring(response))
+            return
+        end
+        local statusCode = response and (response.StatusCode or response.Status)
+        if statusCode and tonumber(statusCode) and tonumber(statusCode) >= 400 then
+            warn("Safety webhook returned HTTP status " .. tostring(statusCode))
         end
     end)
 end
@@ -1193,14 +1423,14 @@ end
 -- Wait only while Main mode is selected. Mode changes interrupt the current combat cycle.
 local function WaitForMain(seconds)
     local finish = os.clock() + seconds
-    while Running and Mode == "Main" do
+    while Running and Mode == "Main" and not SafetyPaused do
         local remaining = finish - os.clock()
         if remaining <= 0 then
             break
         end
         task.wait(math.min(0.03, remaining))
     end
-    return Running and Mode == "Main"
+    return Running and Mode == "Main" and not SafetyPaused
 end
 local function CancelPendingAltDamageReset()
     AltDamageResetToken += 1
@@ -1250,6 +1480,7 @@ local function MonitorAltDamage(character)
             if not tookDamage
                 or not ALT_RESET_ON_DAMAGE
                 or not Running
+                or SafetyPaused
                 or Mode ~= "Alt"
                 or Player.Character ~= character
                 or humanoid.Health <= 0
@@ -1262,6 +1493,7 @@ local function MonitorAltDamage(character)
             local function ResetIfStillValid()
                 if resetToken == AltDamageResetToken
                     and Running
+                    and not SafetyPaused
                     and ALT_RESET_ON_DAMAGE
                     and Mode == "Alt"
                     and Player.Character == character
@@ -1742,7 +1974,7 @@ local function StartMainWebhookSchedule()
 end
 -- Virtual mouse input
 local function Mouse(down)
-    if not Running and down then
+    if (not Running or SafetyPaused) and down then
         return
     end
     local position = UserInputService:GetMouseLocation()
@@ -1759,7 +1991,7 @@ local function Mouse(down)
 end
 -- Virtual keyboard input
 local function Key(keyCode, down)
-    if not Running and down then
+    if (not Running or SafetyPaused) and down then
         return
     end
     pcall(function()
@@ -1822,12 +2054,12 @@ end
 SetupAntiAFK()
 -- Left mouse hold for 50ms; stop the hold if the user switches out of Main mode.
 local function Click50ms()
-    if not Running or Mode ~= "Main" then
+    if not Running or SafetyPaused or Mode ~= "Main" then
         return false
     end
     Mouse(true)
     local finish = os.clock() + 0.005
-    while Running and Mode == "Main" do
+    while Running and not SafetyPaused and Mode == "Main" do
         local remaining = finish - os.clock()
         if remaining <= 0 then
             break
@@ -1839,7 +2071,7 @@ local function Click50ms()
 end
 -- Brief key tap
 local function TapKey(keyCode)
-    if not Running or Mode ~= "Main" then
+    if not Running or SafetyPaused or Mode ~= "Main" then
         return false
     end
     -- Keep following this same locked target after the key press.
@@ -1897,7 +2129,7 @@ local function GetOldestAliveTarget()
 end
 -- Teleport the local character's HumanoidRootPart to an exact staging position while preserving rotation.
 local function TeleportLocalToStaging()
-    if not Running then
+    if not Running or (SafetyPaused and not SafetyPauseApplyingStage) then
         return false
     end
     local character = Player.Character
@@ -1950,7 +2182,7 @@ local function TeleportLocalToStaging()
 end
 -- Teleport behind a selected target, one stud back, matching target root rotation.
 local function TeleportBehindTarget(chosen)
-    if not Running or Mode ~= "Main" then
+    if not Running or SafetyPaused or Mode ~= "Main" then
         return false
     end
     local character = Player.Character
@@ -1999,13 +2231,13 @@ end
 -- following this same target after the key press until it dies/despawns; a
 -- different target can only be selected at the next skill attempt.
 local function TeleportThenTapKey(keyCode)
-    if not Running or Mode ~= "Main" then
+    if not Running or SafetyPaused or Mode ~= "Main" then
         return false
     end
     TargetTeleporting = false
     TargetLockedForSkill = nil
     TargetEngaged = false
-    while Running and Mode == "Main" and not InVoidPhase do
+    while Running and not SafetyPaused and Mode == "Main" and not InVoidPhase do
         local chosen = GetOldestAliveTarget()
         if chosen then
             TargetLockedForSkill = chosen
@@ -2181,6 +2413,11 @@ RunService:BindToRenderStep(
         if not Running then
             return
         end
+        if SafetyPaused then
+            RestoreAltAutoRotate()
+            StopAltAnimation()
+            return
+        end
         if Mode ~= "Alt" then
             RestoreAltAutoRotate()
             StopAltAnimation()
@@ -2218,7 +2455,7 @@ RunService:BindToRenderStep(
     end
 )
 local function SetStage(newStage)
-    if not Running or (newStage ~= "Void" and newStage ~= "Baseplate") then
+    if not Running or SafetyPaused or (newStage ~= "Void" and newStage ~= "Baseplate") then
         return
     end
     if CurrentStage == newStage then
@@ -2233,6 +2470,9 @@ local function SetStage(newStage)
 
     UpdateVoidPlatformForStage()
     UpdateStageButtons()
+    if SafetyPaused then
+        return
+    end
 
     -- Alt is always staged, so move it immediately. In Main, avoid interrupting
     -- an active target/skill cycle; the staging loop applies the new choice once idle.
@@ -2273,7 +2513,7 @@ local function SetMode(newMode)
         InVoidPhase = false
     end
     UpdateModeButtons()
-    if Mode == "Alt" then
+    if Mode == "Alt" and not SafetyPaused then
         TeleportLocalToStaging()
     end
 end
@@ -2335,6 +2575,27 @@ table.insert(Connections, Player.CharacterAdded:Connect(function(character)
         if not root or not Running or Player.Character ~= character then
             return
         end
+        if SafetyPaused then
+            if SafetyPauseAnchoredRoot and SafetyPauseAnchoredRoot ~= root
+                and SafetyPauseAnchoredRoot.Parent then
+                pcall(function()
+                    SafetyPauseAnchoredRoot.Anchored = SafetyPauseRootWasAnchored == true
+                end)
+            end
+            SafetyPauseAnchoredRoot = nil
+            SafetyPauseRootWasAnchored = nil
+            SafetyPauseApplyingStage = true
+            local staged = TeleportLocalToStaging()
+            SafetyPauseApplyingStage = false
+            if staged and root and root.Parent then
+                SafetyPauseAnchoredRoot = root
+                SafetyPauseRootWasAnchored = root.Anchored
+                root.Anchored = true
+            else
+                warn("AltFarm: safety pause is active; will retry staging on the next safety check.")
+            end
+            return
+        end
         if InVoidPhase then
             return
         end
@@ -2358,6 +2619,7 @@ task.spawn(function()
             end
 
             if ALT_ALIVE_FAILSAFE_ENABLED
+                and not SafetyPaused
                 and Mode == "Alt"
                 and not AltAliveResetTriggered
                 and AltAliveSince
@@ -2444,7 +2706,7 @@ table.insert(Connections, StopButton.Activated:Connect(Stop))
 -- Emote Spin remote loop: active in Main mode only.
 task.spawn(function()
     while Running do
-        if Mode == "Main" and not InVoidPhase then
+        if Mode == "Main" and not SafetyPaused and not InVoidPhase then
             local character = Player.Character
             local event = character and character:FindFirstChild("Communicate")
             if event and event:IsA("RemoteEvent") then
@@ -2474,7 +2736,7 @@ end)
 -- below Y=-550 re-enables following for the same locked target as requested.
 task.spawn(function()
     while Running do
-        if Mode == "Main" then
+        if Mode == "Main" and not SafetyPaused then
             local character = Player.Character
             local root = character and character:FindFirstChild("HumanoidRootPart")
             local deepVoidOverride = root
@@ -2517,7 +2779,7 @@ end)
 -- Main mode retains its existing staging behavior while waiting for a target.
 task.spawn(function()
     while Running do
-        if not InVoidPhase then
+        if not SafetyPaused and not InVoidPhase then
             if Mode == "Alt" then
                 TargetEngaged = false
                 local character = Player.Character
@@ -2541,7 +2803,7 @@ task.spawn(function()
     end
 end)
 local function RunMainCycle()
-    if not Running or Mode ~= "Main" then
+    if not Running or SafetyPaused or Mode ~= "Main" then
         return false
     end
     -- Wait for a target to have been alive >= TARGET_ALIVE_SECONDS seconds, teleport behind them, wait 0.2s, press 2.
@@ -2577,6 +2839,7 @@ local function RunMainCycle()
         end)
         local deathDeadline = os.clock() + MAIN_VOID_HEALTH_ZERO_DURATION
         while Running
+            and not SafetyPaused
             and Mode == "Main"
             and Player.Character == character
             and humanoid.Parent
@@ -2601,7 +2864,7 @@ end
 -- Main automation loop. Selecting Alt pauses combat; selecting Main resumes it.
 task.spawn(function()
     while Running do
-        if Mode == "Main" then
+        if Mode == "Main" and not SafetyPaused then
             RunMainCycle()
         else
             if not Wait(0.05) then
@@ -2610,3 +2873,277 @@ task.spawn(function()
         end
     end
 end)
+
+--========================================================
+-- SAFETY MONITOR: blacklist kick + high-kill pause
+--========================================================
+local GroupRoleCache = {}
+local GroupRoleCheckPending = {}
+local GroupRoleLastCheck = {}
+local SafetyPauseBlockedUserIds = {}
+table.insert(Connections, Players.PlayerRemoving:Connect(function(leavingPlayer)
+    -- Key role caches by Player instance so a same-UserId rejoin cannot reuse stale role data.
+    GroupRoleCache[leavingPlayer] = nil
+    GroupRoleCheckPending[leavingPlayer] = nil
+    GroupRoleLastCheck[leavingPlayer] = nil
+end))
+
+local function NormalizeRoleText(value)
+    return tostring(value or ""):lower():gsub("%s+", "")
+end
+
+local function RoleMatchesBlacklist(roleName)
+    local normalizedRole = NormalizeRoleText(roleName)
+    if normalizedRole == "" then
+        return false
+    end
+    for _, configuredKeyword in ipairs(BLACKLISTED_GROUP_ROLE_KEYWORDS) do
+        local keyword = NormalizeRoleText(configuredKeyword)
+        if keyword ~= "" and normalizedRole:find(keyword, 1, true) then
+            return true, configuredKeyword
+        end
+    end
+    return false
+end
+
+local function RefreshGroupRoleBlacklistCache(otherPlayer, now)
+    if GroupRoleCheckPending[otherPlayer] then
+        return
+    end
+    local lastCheck = GroupRoleLastCheck[otherPlayer] or 0
+    if now - lastCheck < GROUP_ROLE_RECHECK_SECONDS then
+        return
+    end
+
+    GroupRoleCheckPending[otherPlayer] = true
+    GroupRoleLastCheck[otherPlayer] = now
+    local checkedGroupId = BLACKLISTED_GROUP_ID
+    task.spawn(function()
+        local inGroup = false
+        local roleName = ""
+        local groupCallOk, groupResult = pcall(function()
+            return otherPlayer:IsInGroup(checkedGroupId)
+        end)
+        if groupCallOk and groupResult then
+            local roleCallOk, roleResult = pcall(function()
+                return otherPlayer:GetRoleInGroup(checkedGroupId)
+            end)
+            if roleCallOk then
+                roleName = tostring(roleResult or "")
+                inGroup = RoleMatchesBlacklist(roleName)
+            end
+        end
+        if otherPlayer.Parent == Players then
+            GroupRoleCache[otherPlayer] = {
+                matches = inGroup,
+                role = roleName,
+                groupId = checkedGroupId,
+                checkedAt = os.clock(),
+            }
+        end
+        GroupRoleCheckPending[otherPlayer] = nil
+    end)
+end
+
+local function FindBlacklistedPlayer()
+    local now = os.clock()
+    for _, otherPlayer in ipairs(Players:GetPlayers()) do
+        if otherPlayer ~= Player then
+            if BLACKLISTED_USER_ID_LOOKUP[tonumber(otherPlayer.UserId)] then
+                return otherPlayer, "blacklisted UserId " .. tostring(otherPlayer.UserId)
+            end
+
+            RefreshGroupRoleBlacklistCache(otherPlayer, now)
+            local cached = GroupRoleCache[otherPlayer]
+            if cached and cached.groupId == BLACKLISTED_GROUP_ID
+                and RoleMatchesBlacklist(cached.role) then
+                return otherPlayer, "group " .. tostring(BLACKLISTED_GROUP_ID)
+                    .. " role " .. tostring(cached.role)
+            end
+        end
+    end
+    return nil
+end
+
+local function FindHighKillPlayer()
+    for _, otherPlayer in ipairs(Players:GetPlayers()) do
+        if otherPlayer ~= Player then
+            local totalKills = GetPlayerTotalKills(otherPlayer)
+            if totalKills and totalKills >= KILL_PAUSE_THRESHOLD then
+                return otherPlayer, totalKills
+            end
+        end
+    end
+    return nil
+end
+
+local function ReleaseAutomationInputs()
+    if MouseHeld then
+        Mouse(false)
+    end
+    for keyCode in pairs(HeldKeys) do
+        pcall(function()
+            VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
+        end)
+        HeldKeys[keyCode] = nil
+    end
+end
+
+local function EnterSafetyPause(highKillPlayer, totalKills)
+    if SafetyPaused or SafetyTerminating then
+        return
+    end
+
+    SafetyPaused = true
+    SafetyPauseReason = "High kill player"
+    SafetyPauseBlockedUserIds[highKillPlayer.UserId] = true
+    TargetTeleporting = false
+    TargetLockedForSkill = nil
+    TargetEngaged = false
+    InVoidPhase = false
+    CancelPendingAltDamageReset()
+    ReleaseAutomationInputs()
+    StopAltAnimation()
+    RestoreAltAutoRotate()
+    -- Force one fresh staging placement for this pause, even if Alt already
+    -- used its normal once-per-life stage teleport earlier.
+    AltStageTeleportedCharacter = nil
+    StagingPositionCharacter = nil
+    CurrentStagingPosition = nil
+
+    -- Send one @everyone alert on the transition into the paused state.
+    SendSafetyWebhookNotice(
+        "Paused due to high kill player",
+        tostring(highKillPlayer.Name) .. " has " .. tostring(totalKills)
+            .. " Total Kills (threshold " .. tostring(KILL_PAUSE_THRESHOLD)
+            .. "). Automation is paused until this player leaves."
+    )
+
+    -- Move onto the selected stage once, then anchor the root so no farming,
+    -- reset, animation, or movement loop can move the account until resume.
+    SafetyPauseApplyingStage = true
+    local stageCallOK, staged = pcall(TeleportLocalToStaging)
+    SafetyPauseApplyingStage = false
+    local character = Player.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if stageCallOK and staged and root and root:IsA("BasePart") then
+        SafetyPauseAnchoredRoot = root
+        SafetyPauseRootWasAnchored = root.Anchored
+        root.Anchored = true
+    else
+        SafetyPauseAnchoredRoot = nil
+        SafetyPauseRootWasAnchored = nil
+        warn("AltFarm: safety pause active; staging teleport will retry when a valid stage/character is available.")
+    end
+
+    warn("AltFarm paused: high-kill player detected: " .. tostring(highKillPlayer.Name)
+        .. " (" .. tostring(totalKills) .. " Total Kills).")
+end
+
+local function ExitSafetyPause()
+    if not SafetyPaused or SafetyTerminating then
+        return
+    end
+    if SafetyPauseAnchoredRoot and SafetyPauseAnchoredRoot.Parent then
+        pcall(function()
+            SafetyPauseAnchoredRoot.Anchored = SafetyPauseRootWasAnchored == true
+        end)
+    end
+    SafetyPauseAnchoredRoot = nil
+    SafetyPauseRootWasAnchored = nil
+    table.clear(SafetyPauseBlockedUserIds)
+    SafetyPaused = false
+    SafetyPauseReason = nil
+    TargetLockedForSkill = nil
+    TargetTeleporting = false
+    TargetEngaged = false
+    InVoidPhase = false
+    print("AltFarm resumed: no high-kill players remain in the server.")
+end
+
+local function DisablePersistenceAndKickBlacklistedPlayer(foundPlayer, reason)
+    if SafetyTerminating or not Running then
+        return
+    end
+
+    SafetyTerminating = true
+    SafetyPaused = true
+    KeepScriptEnabled = false
+    StoreExecutorFlag(KEEP_SCRIPT_FLAG, false)
+    DisableAutoRejoin()
+    SendSafetyWebhookNotice(
+        "Kicked due to blacklisted player joining",
+        "Detected " .. tostring(foundPlayer.Name) .. " (UserId "
+            .. tostring(foundPlayer.UserId) .. "): " .. tostring(reason)
+            .. ". Keep Script and Auto Rejoin were disabled for this account."
+    )
+    warn("AltFarm: blacklisted player detected: " .. tostring(foundPlayer.Name)
+        .. " (" .. tostring(foundPlayer.UserId) .. ") — " .. tostring(reason)
+        .. ". Auto Rejoin disabled; kicking local account.")
+
+    -- Stop every loop before kicking, and leave enough time for the asynchronous
+    -- webhook request to start. Each account running AltFarm handles its own kick.
+    Stop()
+    task.delay(0.6, function()
+        pcall(function()
+            Player:Kick("AltFarm safety: blacklisted player joined.")
+        end)
+    end)
+end
+
+task.spawn(function()
+    while Running do
+        -- Blacklist checks take priority over pausing for high-kill users.
+        local blacklistedPlayer, blacklistReason = FindBlacklistedPlayer()
+        if blacklistedPlayer then
+            DisablePersistenceAndKickBlacklistedPlayer(blacklistedPlayer, blacklistReason)
+            break
+        end
+
+        local highKillPlayer, totalKills = FindHighKillPlayer()
+        if highKillPlayer then
+            if not SafetyPaused then
+                EnterSafetyPause(highKillPlayer, totalKills)
+            else
+                -- If another high-kill player appears while paused, remember them too.
+                SafetyPauseBlockedUserIds[highKillPlayer.UserId] = true
+            end
+        end
+
+        if SafetyPaused then
+            -- Retry staging if the pause began while the local character was dead
+            -- or the stage was temporarily unavailable.
+            if not SafetyPauseAnchoredRoot then
+                local character = Player.Character
+                local root = character and character:FindFirstChild("HumanoidRootPart")
+                local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+                if character and root and humanoid and humanoid.Health > 0 then
+                    SafetyPauseApplyingStage = true
+                    local stageCallOK, staged = pcall(TeleportLocalToStaging)
+                    SafetyPauseApplyingStage = false
+                    if stageCallOK and staged then
+                        SafetyPauseAnchoredRoot = root
+                        SafetyPauseRootWasAnchored = root.Anchored
+                        root.Anchored = true
+                    end
+                end
+            end
+
+            -- Unpause only when every high-kill player previously detected has
+            -- actually left this server, not merely when their stat is unavailable.
+            local blockedPlayerStillHere = false
+            for _, otherPlayer in ipairs(Players:GetPlayers()) do
+                if otherPlayer ~= Player and SafetyPauseBlockedUserIds[otherPlayer.UserId] then
+                    blockedPlayerStillHere = true
+                    break
+                end
+            end
+            if not blockedPlayerStillHere then
+                ExitSafetyPause()
+            end
+        end
+
+        task.wait(SAFETY_PLAYER_CHECK_INTERVAL)
+    end
+end)
+
