@@ -32,7 +32,7 @@ local PlayerGui = Player:WaitForChild("PlayerGui")
 
 -- Raw host URL used for queued teleport reloads. Bump this query value when publishing
 -- a new hosted revision so cached raw responses don't keep an older script running.
-local SCRIPT_RAW_URL = "https://raw.githubusercontent.com/ShedlardoArkamArkam/z/refs/heads/main/altfarm?altfarm_version=20261027d"
+local SCRIPT_RAW_URL = "https://raw.githubusercontent.com/ShedlardoArkamArkam/z/refs/heads/main/altfarm?altfarm_version=20261027e"
 local FARM_CONFIG_KEY = "ALT_FARM_CONFIG"
 local KEEP_SCRIPT_FLAG = "ALT_FARM_KEEP_SCRIPT_ENABLED"
 local AUTO_REJOIN_FLAG = "ALT_FARM_AUTO_REJOIN_ENABLED"
@@ -1757,12 +1757,20 @@ local function GetKillsNeededForWebhook()
 end
 
 local function GetPlayerTotalKills(player)
-    local stats = player:FindFirstChild("leaderstats")
-    if not stats then
-        return nil
+    -- Prefer a Total Kills value parented directly to the Player.
+    local stat = player:FindFirstChild("Total Kills")
+    if stat then
+        return tonumber(stat.Value)
     end
-    local stat = stats:FindFirstChild("Total Kills")
-    return stat and tonumber(stat.Value) or nil
+
+    -- Fall back to the conventional leaderstats folder if the direct value is absent.
+    local stats = player:FindFirstChild("leaderstats")
+    if stats then
+        stat = stats:FindFirstChild("Total Kills")
+        return stat and tonumber(stat.Value) or nil
+    end
+
+    return nil
 end
 
 local function BuildOtherPlayersFields()
