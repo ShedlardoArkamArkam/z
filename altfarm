@@ -32,7 +32,7 @@ local PlayerGui = Player:WaitForChild("PlayerGui")
 
 -- Raw host URL used for queued teleport reloads. Bump this query value when publishing
 -- a new hosted revision so cached raw responses don't keep an older script running.
-local SCRIPT_RAW_URL = "https://raw.githubusercontent.com/ShedlardoArkamArkam/z/refs/heads/main/altfarm?altfarm_version=20261027c"
+local SCRIPT_RAW_URL = "https://raw.githubusercontent.com/ShedlardoArkamArkam/z/refs/heads/main/altfarm?altfarm_version=20261027d"
 local FARM_CONFIG_KEY = "ALT_FARM_CONFIG"
 local KEEP_SCRIPT_FLAG = "ALT_FARM_KEEP_SCRIPT_ENABLED"
 local AUTO_REJOIN_FLAG = "ALT_FARM_AUTO_REJOIN_ENABLED"
@@ -263,7 +263,6 @@ local InVoidPhase = false
 -- Safety guards. While SafetyPaused is true, automation/reset/teleport loops stop;
 -- the safety monitor and anti-AFK handler remain active.
 local SafetyPaused = false
-local SafetyPauseReason = nil
 local SafetyPauseApplyingStage = false
 local SafetyPauseAnchoredRoot = nil
 local SafetyPauseRootWasAnchored = nil
@@ -2877,28 +2876,32 @@ end)
 --========================================================
 -- SAFETY MONITOR: blacklist kick + high-kill pause
 --========================================================
-local GroupRoleCache = {}
-local GroupRoleCheckPending = {}
-local GroupRoleLastCheck = {}
-local SafetyPauseBlockedUserIds = {}
+-- Store the monitor state and helpers on one table to avoid exhausting the
+-- enclosing script chunk's 200-local register limit.
+local SafetyMonitor = {
+    RoleCache = {},
+    CheckPending = {},
+    LastCheck = {},
+    PauseBlockedUserIds = {},
+}
 table.insert(Connections, Players.PlayerRemoving:Connect(function(leavingPlayer)
     -- Key role caches by Player instance so a same-UserId rejoin cannot reuse stale role data.
-    GroupRoleCache[leavingPlayer] = nil
-    GroupRoleCheckPending[leavingPlayer] = nil
-    GroupRoleLastCheck[leavingPlayer] = nil
+    SafetyMonitor.RoleCache[leavingPlayer] = nil
+    SafetyMonitor.CheckPending[leavingPlayer] = nil
+    SafetyMonitor.LastCheck[leavingPlayer] = nil
 end))
 
-local function NormalizeRoleText(value)
+function SafetyMonitor.NormalizeRoleText(value)
     return tostring(value or ""):lower():gsub("%s+", "")
 end
 
-local function RoleMatchesBlacklist(roleName)
-    local normalizedRole = NormalizeRoleText(roleName)
+function SafetyMonitor.RoleMatchesBlacklist(roleName)
+    local normalizedRole = SafetyMonitor.NormalizeRoleText(roleName)
     if normalizedRole == "" then
         return false
     end
     for _, configuredKeyword in ipairs(BLACKLISTED_GROUP_ROLE_KEYWORDS) do
-        local keyword = NormalizeRoleText(configuredKeyword)
+        local keyword = SafetyMonitor.NormalizeRoleText(configuredKeyword)
         if keyword ~= "" and normalizedRole:find(keyword, 1, true) then
             return true, configuredKeyword
         end
@@ -2906,17 +2909,17 @@ local function RoleMatchesBlacklist(roleName)
     return false
 end
 
-local function RefreshGroupRoleBlacklistCache(otherPlayer, now)
-    if GroupRoleCheckPending[otherPlayer] then
+function SafetyMonitor.RefreshGroupRoleBlacklistCache(otherPlayer, now)
+    if SafetyMonitor.CheckPending[otherPlayer] then
         return
     end
-    local lastCheck = GroupRoleLastCheck[otherPlayer] or 0
+    local lastCheck = SafetyMonitor.LastCheck[otherPlayer] or 0
     if now - lastCheck < GROUP_ROLE_RECHECK_SECONDS then
         return
     end
 
-    GroupRoleCheckPending[otherPlayer] = true
-    GroupRoleLastCheck[otherPlayer] = now
+    SafetyMonitor.CheckPending[otherPlayer] = true
+    SafetyMonitor.LastCheck[otherPlayer] = now
     local checkedGroupId = BLACKLISTED_GROUP_ID
     task.spawn(function()
         local inGroup = false
@@ -2930,22 +2933,22 @@ local function RefreshGroupRoleBlacklistCache(otherPlayer, now)
             end)
             if roleCallOk then
                 roleName = tostring(roleResult or "")
-                inGroup = RoleMatchesBlacklist(roleName)
+                inGroup = SafetyMonitor.RoleMatchesBlacklist(roleName)
             end
         end
         if otherPlayer.Parent == Players then
-            GroupRoleCache[otherPlayer] = {
+            SafetyMonitor.RoleCache[otherPlayer] = {
                 matches = inGroup,
                 role = roleName,
                 groupId = checkedGroupId,
                 checkedAt = os.clock(),
             }
         end
-        GroupRoleCheckPending[otherPlayer] = nil
+        SafetyMonitor.CheckPending[otherPlayer] = nil
     end)
 end
 
-local function FindBlacklistedPlayer()
+function SafetyMonitor.FindBlacklistedPlayer()
     local now = os.clock()
     for _, otherPlayer in ipairs(Players:GetPlayers()) do
         if otherPlayer ~= Player then
@@ -2953,10 +2956,10 @@ local function FindBlacklistedPlayer()
                 return otherPlayer, "blacklisted UserId " .. tostring(otherPlayer.UserId)
             end
 
-            RefreshGroupRoleBlacklistCache(otherPlayer, now)
-            local cached = GroupRoleCache[otherPlayer]
+            SafetyMonitor.RefreshGroupRoleBlacklistCache(otherPlayer, now)
+            local cached = SafetyMonitor.RoleCache[otherPlayer]
             if cached and cached.groupId == BLACKLISTED_GROUP_ID
-                and RoleMatchesBlacklist(cached.role) then
+                and SafetyMonitor.RoleMatchesBlacklist(cached.role) then
                 return otherPlayer, "group " .. tostring(BLACKLISTED_GROUP_ID)
                     .. " role " .. tostring(cached.role)
             end
@@ -2965,7 +2968,7 @@ local function FindBlacklistedPlayer()
     return nil
 end
 
-local function FindHighKillPlayer()
+function SafetyMonitor.FindHighKillPlayer()
     for _, otherPlayer in ipairs(Players:GetPlayers()) do
         if otherPlayer ~= Player then
             local totalKills = GetPlayerTotalKills(otherPlayer)
@@ -2977,7 +2980,7 @@ local function FindHighKillPlayer()
     return nil
 end
 
-local function ReleaseAutomationInputs()
+function SafetyMonitor.ReleaseAutomationInputs()
     if MouseHeld then
         Mouse(false)
     end
@@ -2989,20 +2992,19 @@ local function ReleaseAutomationInputs()
     end
 end
 
-local function EnterSafetyPause(highKillPlayer, totalKills)
+function SafetyMonitor.EnterSafetyPause(highKillPlayer, totalKills)
     if SafetyPaused or SafetyTerminating then
         return
     end
 
     SafetyPaused = true
-    SafetyPauseReason = "High kill player"
-    SafetyPauseBlockedUserIds[highKillPlayer.UserId] = true
+    SafetyMonitor.PauseBlockedUserIds[highKillPlayer.UserId] = true
     TargetTeleporting = false
     TargetLockedForSkill = nil
     TargetEngaged = false
     InVoidPhase = false
     CancelPendingAltDamageReset()
-    ReleaseAutomationInputs()
+    SafetyMonitor.ReleaseAutomationInputs()
     StopAltAnimation()
     RestoreAltAutoRotate()
     -- Force one fresh staging placement for this pause, even if Alt already
@@ -3040,7 +3042,7 @@ local function EnterSafetyPause(highKillPlayer, totalKills)
         .. " (" .. tostring(totalKills) .. " Total Kills).")
 end
 
-local function ExitSafetyPause()
+function SafetyMonitor.ExitSafetyPause()
     if not SafetyPaused or SafetyTerminating then
         return
     end
@@ -3051,9 +3053,8 @@ local function ExitSafetyPause()
     end
     SafetyPauseAnchoredRoot = nil
     SafetyPauseRootWasAnchored = nil
-    table.clear(SafetyPauseBlockedUserIds)
+    table.clear(SafetyMonitor.PauseBlockedUserIds)
     SafetyPaused = false
-    SafetyPauseReason = nil
     TargetLockedForSkill = nil
     TargetTeleporting = false
     TargetEngaged = false
@@ -3061,7 +3062,7 @@ local function ExitSafetyPause()
     print("AltFarm resumed: no high-kill players remain in the server.")
 end
 
-local function DisablePersistenceAndKickBlacklistedPlayer(foundPlayer, reason)
+function SafetyMonitor.DisablePersistenceAndKickBlacklistedPlayer(foundPlayer, reason)
     if SafetyTerminating or not Running then
         return
     end
@@ -3094,19 +3095,19 @@ end
 task.spawn(function()
     while Running do
         -- Blacklist checks take priority over pausing for high-kill users.
-        local blacklistedPlayer, blacklistReason = FindBlacklistedPlayer()
+        local blacklistedPlayer, blacklistReason = SafetyMonitor.FindBlacklistedPlayer()
         if blacklistedPlayer then
-            DisablePersistenceAndKickBlacklistedPlayer(blacklistedPlayer, blacklistReason)
+            SafetyMonitor.DisablePersistenceAndKickBlacklistedPlayer(blacklistedPlayer, blacklistReason)
             break
         end
 
-        local highKillPlayer, totalKills = FindHighKillPlayer()
+        local highKillPlayer, totalKills = SafetyMonitor.FindHighKillPlayer()
         if highKillPlayer then
             if not SafetyPaused then
-                EnterSafetyPause(highKillPlayer, totalKills)
+                SafetyMonitor.EnterSafetyPause(highKillPlayer, totalKills)
             else
                 -- If another high-kill player appears while paused, remember them too.
-                SafetyPauseBlockedUserIds[highKillPlayer.UserId] = true
+                SafetyMonitor.PauseBlockedUserIds[highKillPlayer.UserId] = true
             end
         end
 
@@ -3133,13 +3134,13 @@ task.spawn(function()
             -- actually left this server, not merely when their stat is unavailable.
             local blockedPlayerStillHere = false
             for _, otherPlayer in ipairs(Players:GetPlayers()) do
-                if otherPlayer ~= Player and SafetyPauseBlockedUserIds[otherPlayer.UserId] then
+                if otherPlayer ~= Player and SafetyMonitor.PauseBlockedUserIds[otherPlayer.UserId] then
                     blockedPlayerStillHere = true
                     break
                 end
             end
             if not blockedPlayerStillHere then
-                ExitSafetyPause()
+                SafetyMonitor.ExitSafetyPause()
             end
         end
 
